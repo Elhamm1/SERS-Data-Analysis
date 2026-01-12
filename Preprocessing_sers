@@ -1,0 +1,276 @@
+# Reusable preprocessing for SERS spectra:
+# 1) Savitzky–Golay smoothing
+# 2) IModPoly baseline correction
+# 3) Min–Max normalization (fit on TRAIN only)
+
+import numpy as np
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+from scipy.signal import savgol_filter
+
+
+# -----------------------------
+# Shape helpers
+# -----------------------------
+def ensure_2d_spectra(arr: np.ndarray, input_length: Optional[int] = None) -> np.ndarray:
+    """
+    Accepts (L,), (N,L), or (N,1,L). Returns (N,L).
+    """
+    arr = np.asarray(arr)
+
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    elif arr.ndim == 3 and arr.shape[1] == 1:
+        arr = arr[:, 0, :]
+    elif arr.ndim != 2:
+        raise ValueError("Unexpected spectra shape: {}".format(arr.shape))
+
+    if input_length is not None and arr.shape[1] != int(input_length):
+        raise ValueError("Spectra length {} != expected {}".format(arr.shape[1], input_length))
+
+    return arr
+
+
+# -----------------------------
+# 1) Savitzky–Golay smoothing
+# -----------------------------
+def _validate_savgol_params(L: int, window_length: int, polyorder: int) -> int:
+    """
+    Ensure Savitzky–Golay params are valid:
+      - window_length odd
+      - window_length <= L
+      - window_length >= polyorder + 2
+    """
+    wl = min(int(window_length), int(L))
+    if wl % 2 == 0:
+        wl -= 1
+
+    if wl < polyorder + 2:
+        wl = polyorder + 2
+        if wl % 2 == 0:
+            wl += 1
+
+    if wl > L:
+        wl = L if (L % 2 == 1) else (L - 1)
+
+    return max(3, wl)
+
+
+def savgol_smooth(X: np.ndarray, window_length: int = 11, polyorder: int = 3, mode: str = "interp") -> np.ndarray:
+    """
+    Row-wise Savitzky–Golay smoothing for X shaped (N,L).
+    """
+    X = np.asarray(X, dtype=np.float64)
+    N, L = X.shape
+    wl = _validate_savgol_params(L, window_length, polyorder)
+    if wl < 3 or wl > L:
+        raise ValueError("Invalid Savitzky–Golay window_length {} for length {}".format(wl, L))
+    return savgol_filter(X, window_length=wl, polyorder=polyorder, axis=1, mode=mode)
+
+
+# -----------------------------
+# 2) IModPoly baseline correction
+# -----------------------------
+_EPS = 1e-12
+
+def _mad(x: np.ndarray) -> float:
+    med = np.median(x)
+    return np.median(np.abs(x - med)) + _EPS
+
+
+def imodpoly_baseline(
+    y: np.ndarray,
+    x: Optional[np.ndarray] = None,
+    deg: int = 7,
+    k: float = 2.5,
+    max_iter: int = 30,
+    tol: float = 1e-6,
+    min_keep_frac: float = 0.05,
+) -> np.ndarray:
+    """
+    Robust iterative modified polyfit baseline (IModPoly).
+    Returns the estimated baseline (same shape as y).
+    """
+    y = np.asarray(y, dtype=np.float64)
+    n = y.size
+    if x is None:
+        x = np.arange(n, dtype=np.float64)
+    else:
+        x = np.asarray(x, dtype=np.float64)
+
+    w = np.ones(n, dtype=np.float64)
+    prev_w = w.copy()
+    min_keep = max(5, int(min_keep_frac * n))
+
+    for _ in range(1, max_iter + 1):
+        coeffs = np.polyfit(x, y, deg=deg, w=w)
+        baseline = np.polyval(coeffs, x)
+
+        r = y - baseline
+        thr = k * _mad(r)
+
+        new_w = (r <= thr).astype(np.float64)
+
+        # keep enough "anchor" points
+        if new_w.sum() < min_keep:
+            keep = np.argsort(r)[:min_keep]
+            new_w = np.zeros_like(new_w)
+            new_w[keep] = 1.0
+
+        if np.mean(np.abs(new_w - prev_w)) < tol:
+            w = new_w
+            break
+
+        prev_w = w
+        w = new_w
+
+    coeffs = np.polyfit(x, y, deg=deg, w=w)
+    baseline = np.polyval(coeffs, x)
+    return baseline
+
+
+def imodpoly_correct_matrix(
+    X: np.ndarray,
+    deg: int = 7,
+    k: float = 2.5,
+    max_iter: int = 30,
+    tol: float = 1e-6,
+    min_keep_frac: float = 0.05,
+) -> np.ndarray:
+    """
+    Row-wise baseline correction for X shaped (N,L).
+    Returns corrected spectra: X - baseline.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    N, L = X.shape
+    x = np.arange(L, dtype=np.float64)
+
+    Ycorr = np.empty_like(X)
+    for i in range(N):
+        b = imodpoly_baseline(
+            X[i], x=x, deg=deg, k=k, max_iter=max_iter, tol=tol, min_keep_frac=min_keep_frac
+        )
+        Ycorr[i] = X[i] - b
+    return Ycorr
+
+
+# -----------------------------
+# 3) Min–Max normalization (fit TRAIN only)
+# -----------------------------
+def minmax_fit(X_train: np.ndarray, eps: float = 1e-12) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Fit column-wise min/range on TRAIN only.
+    Returns (mins, rng).
+    """
+    mins = X_train.min(axis=0)
+    maxs = X_train.max(axis=0)
+    rng = np.maximum(maxs - mins, eps)
+    return mins, rng
+
+
+def minmax_transform(X: np.ndarray, mins: np.ndarray, rng: np.ndarray, lo: float = 0.0, hi: float = 1.0) -> np.ndarray:
+    """
+    Apply column-wise min-max using provided mins/rng.
+    """
+    Z = (X - mins) / rng
+    return lo + Z * (hi - lo)
+
+
+# -----------------------------
+# High-level reusable class
+# -----------------------------
+@dataclass
+class PreprocessConfig:
+    input_length: Optional[int] = None
+
+    # SG
+    use_savgol: bool = True
+    sg_window_length: int = 11
+    sg_polyorder: int = 3
+    sg_mode: str = "interp"
+
+    # IModPoly
+    use_imodpoly: bool = True
+    imod_deg: int = 7
+    imod_kmad: float = 2.5
+    imod_max_iter: int = 30
+    imod_tol: float = 1e-6
+    imod_min_keep: float = 0.05
+
+    # MinMax (fit on TRAIN only)
+    use_minmax: bool = True
+    minmax_lo: float = 0.0
+    minmax_hi: float = 1.0
+    minmax_eps: float = 1e-12
+
+
+class SERSPreprocessor:
+    """
+    Fit/transform style preprocessor:
+      - smoothing + baseline correction are always transform-time operations
+      - min-max stats are fit on TRAIN only
+    """
+
+    def __init__(self, cfg: PreprocessConfig):
+        self.cfg = cfg
+        self.mins_ = None
+        self.rng_ = None
+
+    def _apply_filters(self, X_2d: np.ndarray) -> np.ndarray:
+        Xp = X_2d
+
+        if self.cfg.use_savgol:
+            Xp = savgol_smooth(
+                Xp,
+                window_length=self.cfg.sg_window_length,
+                polyorder=self.cfg.sg_polyorder,
+                mode=self.cfg.sg_mode,
+            )
+
+        if self.cfg.use_imodpoly:
+            Xp = imodpoly_correct_matrix(
+                Xp,
+                deg=self.cfg.imod_deg,
+                k=self.cfg.imod_kmad,
+                max_iter=self.cfg.imod_max_iter,
+                tol=self.cfg.imod_tol,
+                min_keep_frac=self.cfg.imod_min_keep,
+            )
+
+        return Xp
+
+    def fit(self, X_train: np.ndarray) -> "SERSPreprocessor":
+        X2 = ensure_2d_spectra(X_train, input_length=self.cfg.input_length)
+        X2 = self._apply_filters(X2)
+
+        if self.cfg.use_minmax:
+            self.mins_, self.rng_ = minmax_fit(X2, eps=self.cfg.minmax_eps)
+
+        return self
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        X2 = ensure_2d_spectra(X, input_length=self.cfg.input_length)
+        X2 = self._apply_filters(X2)
+
+        if self.cfg.use_minmax:
+            if self.mins_ is None or self.rng_ is None:
+                raise RuntimeError("MinMax params not fit. Call fit() on TRAIN first.")
+            X2 = minmax_transform(X2, self.mins_, self.rng_, lo=self.cfg.minmax_lo, hi=self.cfg.minmax_hi)
+
+        return X2
+
+    def fit_transform(self, X_train: np.ndarray) -> np.ndarray:
+        self.fit(X_train)
+        return self.transform(X_train)
+
+    def save_minmax(self, path: str) -> None:
+        if self.mins_ is None or self.rng_ is None:
+            raise RuntimeError("Nothing to save: minmax not fit.")
+        np.savez(path, mins=self.mins_, rng=self.rng_, lo=self.cfg.minmax_lo, hi=self.cfg.minmax_hi)
+
+    def load_minmax(self, path: str) -> None:
+        d = np.load(path)
+        self.mins_ = d["mins"]
+        self.rng_ = d["rng"]
+        # lo/hi stay in cfg (assume consistent)
