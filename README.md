@@ -52,10 +52,10 @@ PDF instructions:
 1) Create an environment
 Option A: pip
 python -m venv .venv
-# macOS/Linux
+macOS/Linux: 
 source .venv/bin/activate
-# Windows
-# .venv\Scripts\activate
+Windows:
+.venv\Scripts\activate
 
 pip install -r requirements.txt
 
