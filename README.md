@@ -49,7 +49,8 @@ PDF instructions:
 
 ## Setup
 
-1) Create an environment
+Create an environment:
+
 Option A: pip
 python -m venv .venv
 macOS/Linux: 
