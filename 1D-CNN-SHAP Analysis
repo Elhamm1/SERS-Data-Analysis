@@ -1,0 +1,410 @@
+# SHAP_analysis.py  
+
+import os, glob, random
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import shap
+
+# ==========================
+# ====== CONFIG =======
+# ==========================
+CV_DATA_DIR    = "../CrossValidationData"
+TEST_CULTIVAR  = "CDC_Jasper"
+BEST_MODEL     = f"best_{TEST_CULTIVAR}.pth"
+
+# SHAP / plotting config
+N_BACKGROUND   = 200
+N_EXPLAIN      = 300
+TOP_K_FEATURES = 20
+SEED           = 42
+
+# Fixed Raman axis file
+AXIS_FILE = "wavenumbers_1496.npy"
+
+# ==============================================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+AXIS_PATH = os.path.join(SCRIPT_DIR, AXIS_FILE)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ====== Output dir ======
+OUT_DIR = "SHAP-analysis-CV"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ====== Reproducibility ======
+random.seed(SEED); np.random.seed(SEED)
+torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+# ====== Cultivar maps ======
+cultivar_cys_map = {
+    "AAC_Chrome":0.3208,"AAC_Lacombe":0.3428,"AAC_Liscard":0.3181,
+    "CDC_Amarillo":0.3834,"CDC_Athabasca":0.3418,"CDC_Canary":0.3117,
+    "CDC_Dakota":0.3293,"CDC_Golden":0.3536,"CDC_Greenwater":0.3446,
+    "CDC_Inca":0.3730,"CDC_Jasper":0.3360,"CDC_Striker":0.3575,
+    "CDC_Lewochko":0.3469,"CDC_Meadow":0.3180,"CDC_Patrick":0.3626,
+    "CDC_Saffron":0.3552,"CDC_Spectrum":0.3948,"CDC_Spruce":0.3535,
+    "CDC_Tetris":0.3531,"Redbat88":0.3194,
+}
+
+# ====== Model (same as training) ======
+class Cys1DCNN(nn.Module):
+    def __init__(self, input_length=1496):
+        super().__init__()
+        self.conv1 = nn.Conv1d(1,16,5,padding=2); self.bn1 = nn.BatchNorm1d(16); self.pool1 = nn.MaxPool1d(2)
+        self.conv2 = nn.Conv1d(16,32,5,padding=2); self.bn2 = nn.BatchNorm1d(32); self.pool2 = nn.MaxPool1d(2)
+        self.conv3 = nn.Conv1d(32,64,5,padding=2); self.bn3 = nn.BatchNorm1d(64); self.pool3 = nn.MaxPool1d(2)
+        self.conv4 = nn.Conv1d(64,128,5,padding=2); self.bn4 = nn.BatchNorm1d(128); self.pool4 = nn.MaxPool1d(2)
+        self.flattened_size = (input_length // 16) * 128
+        self.fc1 = nn.Linear(self.flattened_size,128); self.dropout = nn.Dropout(0.3); self.fc2 = nn.Linear(128,1)
+    def forward(self,x):
+        x = self.pool1(F.relu(self.bn1(self.conv1(x))))
+        x = self.pool2(F.relu(self.bn2(self.conv2(x))))
+        x = self.pool3(F.relu(self.bn3(self.conv3(x))))
+        x = self.pool4(F.relu(self.bn4(self.conv4(x))))
+        x = x.view(-1,self.flattened_size); x = F.relu(self.fc1(x)); x = self.dropout(x)
+        return self.fc2(x)
+
+# ====== Helpers ======
+def find_cultivar_from_filename(filename, keys):
+    for k in keys:
+        if filename.startswith(k): return k
+    return None
+
+def load_axis(axis_path):
+    if not os.path.exists(axis_path):
+        raise FileNotFoundError(f"Axis file not found: {axis_path}")
+    ax = np.load(axis_path, allow_pickle=False).reshape(-1).astype(float)
+    if ax.size == 0: raise ValueError("Axis file is empty.")
+    return ax
+
+def load_intensities_from_npy(file_path, expected_len):
+    arr = np.load(file_path, allow_pickle=False)
+    if arr.ndim == 1: out = arr[None,:]
+    elif arr.ndim == 2:
+        if arr.shape[0]==1: out = arr
+        elif arr.shape[1]==expected_len: out = arr
+        elif arr.shape[1]==2 and arr.shape[0]==expected_len: out = arr[:,1][None,:]
+        elif arr.shape[0]==2 and arr.shape[1]==expected_len: out = arr[1,:][None,:]
+        else: raise ValueError(f"{os.path.basename(file_path)} unexpected 2D shape {arr.shape}")
+    elif arr.ndim == 3:
+        if arr.shape[-1]==2: out = arr[:,:,1]
+        elif arr.shape[1]==2: out = np.swapaxes(arr,1,2)[:,:,1]
+        else: raise ValueError(f"{os.path.basename(file_path)} unexpected 3D shape {arr.shape}")
+    else: raise ValueError(f"{os.path.basename(file_path)} unsupported ndim={arr.ndim}")
+    if out.shape[1] != expected_len:
+        raise ValueError(f"{os.path.basename(file_path)} len {out.shape[1]} != {expected_len}")
+    return out
+
+# ====== Load axis ======
+RAMAN_AXIS = load_axis(os.path.join(SCRIPT_DIR, AXIS_FILE))
+INPUT_LENGTH = int(RAMAN_AXIS.shape[0])
+print(f"[Axis] Loaded Raman axis: length={INPUT_LENGTH} (cm^-1)")
+np.save(os.path.join(OUT_DIR, "wavenumbers_used.npy"), RAMAN_AXIS)
+
+# ====== Gather & split (LOCO) ======
+all_files = sorted(glob.glob(os.path.join(CV_DATA_DIR, "*.npy")))
+if not all_files: raise SystemExit(f"No .npy files found in {CV_DATA_DIR}.")
+cultivars = list(cultivar_cys_map.keys())
+assert TEST_CULTIVAR in cultivars
+
+train_X_list, train_y_list, test_X_list, test_y_list = [], [], [], []
+for fp in all_files:
+    cv = find_cultivar_from_filename(os.path.basename(fp), cultivars)
+    if cv is None: continue
+    intensities = load_intensities_from_npy(fp, expected_len=INPUT_LENGTH)
+    y_vec = np.full((intensities.shape[0],), cultivar_cys_map[cv], float)
+    if cv == TEST_CULTIVAR:
+        test_X_list.append(intensities);  test_y_list.append(y_vec)
+    else:
+        train_X_list.append(intensities); train_y_list.append(y_vec)
+
+if not test_X_list or not train_X_list:
+    raise SystemExit("Insufficient data to rebuild the split.")
+
+X_train = np.vstack(train_X_list)
+Y_train = np.hstack(train_y_list)
+X_test  = np.vstack(test_X_list)     # <-- ALL spectra from TEST_CULTIVAR
+Y_test  = np.hstack(test_y_list)
+
+# ====== Load model ======
+model = Cys1DCNN(INPUT_LENGTH).to(device)
+state = torch.load(BEST_MODEL, map_location=device)
+model.load_state_dict(state); model.eval()
+
+# ====== Background & explained subsets ======
+def sample_rows(X, n):
+    n = min(n, len(X)); 
+    return X[:0] if n<=0 else X[np.random.choice(len(X), size=n, replace=False)]
+
+X_bg_np   = sample_rows(X_train, N_BACKGROUND)
+X_exp_np  = sample_rows(X_test,  N_EXPLAIN)
+
+X_bg  = torch.tensor(X_bg_np,  dtype=torch.float32).unsqueeze(1).to(device)
+X_exp = torch.tensor(X_exp_np, dtype=torch.float32).unsqueeze(1).to(device)
+
+# ====== SHAP explainer & values ======
+explainer = shap.GradientExplainer(model, X_bg)
+shap_values = explainer.shap_values(X_exp)
+if isinstance(shap_values, list): shap_values = shap_values[0]
+if isinstance(shap_values, torch.Tensor): shap_values = shap_values.detach().cpu().numpy()
+shap_values = np.asarray(shap_values)
+
+# Normalize to 2D (N, L)
+if shap_values.ndim == 3 and shap_values.shape[1] == 1:
+    shap_values_2d = shap_values[:,0,:]
+elif shap_values.ndim == 3 and shap_values.shape[2] == 1:
+    shap_values_2d = shap_values[:,:,0]
+elif shap_values.ndim == 2:
+    shap_values_2d = shap_values
+else:
+    shap_values_2d = shap_values.reshape(shap_values.shape[0], -1)
+
+X_exp_2d = np.asarray(X_exp_np)
+NUM_FEATS = min(shap_values_2d.shape[1], X_exp_2d.shape[1])
+shap_values_2d = shap_values_2d[:, :NUM_FEATS]
+X_exp_2d = X_exp_2d[:, :NUM_FEATS]
+RAMAN_AXIS = RAMAN_AXIS[:NUM_FEATS]
+
+# ====== Predictions (for completeness) ======
+with torch.no_grad():
+    preds = model(torch.tensor(X_exp_2d, dtype=torch.float32).unsqueeze(1).to(device)) \
+              .detach().cpu().numpy().squeeze(-1)
+
+# ====== Save raw arrays ======
+np.save(os.path.join(OUT_DIR, "shap_values.npy"), shap_values_2d)
+np.save(os.path.join(OUT_DIR, "X_exp.npy"), X_exp_2d)
+np.save(os.path.join(OUT_DIR, "X_bg.npy"),  X_bg_np)
+np.save(os.path.join(OUT_DIR, "preds.npy"), preds)
+
+# ====== Global importance ======
+mean_abs_shap = np.mean(np.abs(shap_values_2d), axis=0).reshape(-1)
+
+# ====== Feature names / x-axis ======
+x_axis = np.asarray(RAMAN_AXIS).reshape(-1)[:NUM_FEATS]
+feature_names = np.array([f"f_{int(round(v))} cm^-1" for v in x_axis])
+
+# Save CSV for global curve
+pd.DataFrame({"wavenumber_cm^-1": x_axis.astype(float),
+              "mean_abs_shap": mean_abs_shap.astype(float)}
+             ).to_csv(os.path.join(OUT_DIR, "shap_global_importance.csv"), index=False)
+
+# ====== Top-K features (bar) ======
+top_idx = np.argsort(mean_abs_shap)[::-1][:TOP_K_FEATURES]
+top_vals = mean_abs_shap[top_idx]
+top_labels = [f"f_{int(round(x_axis[i]))} cm^-1" for i in top_idx]
+
+pd.DataFrame({
+    "feature_index": top_idx,
+    "label": top_labels,
+    "wavenumber_cm^-1": x_axis[top_idx].astype(float),
+    "mean_abs_shap": top_vals
+}).to_csv(os.path.join(OUT_DIR, "shap_top_features.csv"), index=False)
+
+plt.figure(figsize=(10,5))
+plt.bar(range(len(top_vals)), top_vals)
+plt.xticks(range(len(top_vals)), top_labels, rotation=45, ha="right")
+plt.ylabel("Mean |SHAP|")
+plt.title(f"Top {TOP_K_FEATURES} Features by Mean |SHAP|")
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR, "shap_top_features_bar.png"), dpi=200)
+plt.close()
+
+# =========================================================
+# ==============  OVERLAID GLOBAL IMPORTANCE  =============
+# =========================================================
+# Average spectrum for all spectra of the selected TEST_CULTIVAR
+avg_spec = X_test.mean(axis=0)              # shape (L,)
+avg_spec = avg_spec[:NUM_FEATS]
+
+# Normalize avg spectrum to [0, 1] then scale to the max of mean_abs_shap
+eps = 1e-12
+avg_norm = (avg_spec - avg_spec.min()) / (avg_spec.ptp() + eps)
+avg_norm_scaled = avg_norm * mean_abs_shap.max()
+
+fig, ax1 = plt.subplots(figsize=(10,4))
+
+# SHAP curve in blue
+line1, = ax1.plot(x_axis, mean_abs_shap, lw=1.5, color="blue", label="Mean |SHAP|")
+ax1.set_xlabel("Raman shift (cm$^{-1}$)")
+ax1.set_ylabel("Mean |SHAP|")
+ax1.grid(True, alpha=0.3)
+
+# Avg spectrum in red on secondary axis
+ax2 = ax1.twinx()
+line2, = ax2.plot(x_axis, avg_norm_scaled, lw=1.0, alpha=0.8, color="red",
+                  label="Avg spectrum (normalized)")
+ax2.set_ylabel("Avg intensity (normalized)")
+
+# Combined legend
+lines = [line1, line2]
+labels = [l.get_label() for l in lines]
+ax1.legend(lines, labels, loc="upper right")
+
+ax1.set_title(f"Global SHAP Importance + Avg Spectrum — {TEST_CULTIVAR} (N={len(X_exp_2d)})")
+fig.tight_layout()
+fig.savefig(os.path.join(OUT_DIR, "shap_global_importance.png"), dpi=200)
+plt.close(fig)
+
+# =========================================================
+# ========== Overlay: normalized spectrum + SHAP ==========
+# ========== with shaded biochemical bands ================
+# =========================================================
+
+# -- 1) Define band ranges 
+# Use (start, end, label). For near-delta peaks, give a small +/- window.
+BANDS = [
+    (180, 300,  "Ag–S bond"),
+    (510, 518,  "C–S stretch"),
+    (660, 674,  "S–S bridge"),
+    (752, 762,  "Tyr/Phe ring (757)"),
+    (825, 840,  "Side chains (Tyr)"),
+    (924, 936,  "C–C backbone (929)"),
+    (996, 1008, "Phe marker (1003)"),
+    (1080, 1126,"C–N / backbone"),
+    (1200, 1270,"Amide III"),
+    (1330, 1380,"CH₂/CH₃ def."),
+    (1450, 1465,"CH bending"),
+    (1590, 1610,"Aromatic ring"),
+    (1645, 1665,"Amide I"),
+]
+
+# ========= Annotate top-k SHAP features with biochemical bands =========
+
+# Optional tolerance (cm^-1) to snap a feature to the nearest band center
+# even if it's just outside the defined [lo, hi] range. Set to None to disable.
+BAND_CENTER_TOL = 8.0
+
+# Precompute band centers for "nearest" logic
+_band_centers = [( (lo+hi)/2.0, lbl, lo, hi ) for (lo, hi, lbl) in BANDS]
+
+def assign_band(wavenumber, bands, centers, tol=None):
+    """
+    Returns:
+      in_band_label: label if wn is inside a band's [lo, hi], else None
+      nearest_label: label of nearest band center if within tol, else None
+      nearest_dist:  signed distance (cm^-1) to that band's center (abs used for ranking)
+    """
+    wn = float(wavenumber)
+    # 1) direct range match
+    for (lo, hi, lbl) in bands:
+        if lo <= wn <= hi:
+            return lbl, lbl, 0.0  # inside band; nearest = itself
+
+    # 2) nearest by center within tolerance
+    if tol is not None:
+        dists = [(wn - c, lbl, lo, hi) for (c, lbl, lo, hi) in centers]
+        # pick by absolute distance
+        d, lbl, lo, hi = min(dists, key=lambda t: abs(t[0]))
+        if abs(d) <= tol:
+            return None, lbl, float(d)
+
+    return None, None, None
+
+# Build an annotated DataFrame for the already-computed top-k features
+top_wavenumbers = x_axis[top_idx].astype(float)
+rows = []
+for i, wn in enumerate(top_wavenumbers):
+    in_band_label, nearest_label, nearest_delta = assign_band(wn, BANDS, _band_centers, tol=BAND_CENTER_TOL)
+    rows.append({
+        "rank": i+1,
+        "feature_index": int(top_idx[i]),
+        "label": top_labels[i],
+        "wavenumber_cm^-1": float(wn),
+        "mean_abs_shap": float(top_vals[i]),
+        "in_band_label": in_band_label if in_band_label is not None else "",
+        "nearest_band_label": nearest_label if nearest_label is not None else "",
+        "nearest_center_delta_cm^-1": 0.0 if nearest_delta is None else float(nearest_delta)  # + means feature is above the band center
+    })
+
+annot_df = pd.DataFrame(rows)
+
+# Optional: fill a single "band_match" column for quick reading
+def _choose_band(r):
+    return r["in_band_label"] if r["in_band_label"] else (r["nearest_band_label"] if r["nearest_band_label"] else "Unassigned")
+annot_df["band_match"] = annot_df.apply(_choose_band, axis=1)
+
+# Save alongside original CSV (non-destructive)
+annot_path = os.path.join(OUT_DIR, "shap_top_features_with_bands.csv")
+annot_df.to_csv(annot_path, index=False)
+
+print(f"[Info] Wrote band-annotated top-k features to: {os.path.abspath(annot_path)}")
+
+
+# -- 2) Get the average spectrum for TEST_CULTIVAR (already computed earlier as avg_spec)
+if 'avg_spec' not in locals():
+    avg_spec = X_test.mean(axis=0)[:NUM_FEATS]
+
+# -- 3) Normalize both to [0, 1] on the same scale
+def _norm01(a):
+    a = np.asarray(a, float)
+    rng = a.max() - a.min()
+    return (a - a.min()) / (rng if rng > 0 else 1.0)
+
+spec_norm = _norm01(avg_spec)
+shap_norm = _norm01(mean_abs_shap)
+
+# -- 4) Plot
+fig, ax = plt.subplots(figsize=(12, 4))
+ax.plot(x_axis, spec_norm, lw=1.6, label="Normalized Spectrum", color="red")
+ax.plot(x_axis, shap_norm, lw=1.0, label="Normalized SHAP", color="blue")
+
+# Shade bands
+for (lo, hi, lbl) in BANDS:
+    ax.axvspan(lo, hi, facecolor="orange", alpha=0.15, edgecolor=None, label=lbl)
+
+# Build a clean legend with unique labels (axvspan repeats)
+handles, labels = ax.get_legend_handles_labels()
+seen = set()
+uniq_handles, uniq_labels = [], []
+for h, l in zip(handles, labels):
+    if l not in seen:
+        uniq_handles.append(h); uniq_labels.append(l); seen.add(l)
+
+ax.legend(uniq_handles, uniq_labels, loc="upper right", framealpha=1.0)
+ax.set_xlim(x_axis.min(), x_axis.max())
+ax.set_ylim(0, 1.05)
+ax.set_xlabel("Raman Shift (cm$^{-1}$)")
+ax.set_ylabel("Normalized Value")
+ax.set_title("Overlay: Normalized Spectrum & SHAP with Highlighted Bands")
+ax.grid(True, alpha=0.3)
+fig.tight_layout()
+fig.savefig(os.path.join(OUT_DIR, "overlay_spectrum_shap_highlighted_bands.png"), dpi=200)
+plt.close(fig)
+
+
+# ====== Beeswarm (kept)
+shap.summary_plot(shap_values_2d, X_exp_2d, feature_names=feature_names, show=False)
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR, "shap_summary_beeswarm.png"), dpi=200, bbox_inches="tight")
+plt.close()
+
+# ====== Heatmap (kept)
+heat_data = shap_values_2d[np.argsort(preds)][:, top_idx]
+plt.figure(figsize=(max(6, TOP_K_FEATURES*0.35), 6))
+plt.imshow(heat_data, aspect='auto', interpolation='nearest')
+plt.colorbar(label="SHAP value"); plt.yticks([])
+plt.xticks(ticks=np.arange(len(top_idx)), labels=top_labels, rotation=45, ha="right")
+plt.title(f"SHAP Heatmap — Top {TOP_K_FEATURES} Features")
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR, "shap_heatmap_topK.png"), dpi=200)
+plt.close()
+
+print(
+    f"Done. Saved outputs in: {os.path.abspath(OUT_DIR)}\n"
+    f"Model: {BEST_MODEL}  |  Test cultivar: {TEST_CULTIVAR}\n"
+    f"Explained samples: {len(X_exp_2d)}  |  Background size: {len(X_bg_np)}\n"
+    f"Axis source: {AXIS_PATH} | Axis length: {INPUT_LENGTH}\n"
+    f"Artifacts saved:\n"
+    f" - shap_global_importance.png  (OVERLAID with avg spectrum)\n"
+    f" - shap_global_importance.csv\n"
+    f" - shap_top_features_bar.png / shap_top_features.csv\n"
+    f" - shap_summary_beeswarm.png\n"
+    f" - shap_heatmap_topK.png\n"
+    f" - shap_values.npy, X_exp.npy, X_bg.npy, preds.npy, wavenumbers_used.npy\n"
+)
+
