@@ -1,0 +1,605 @@
+import os, glob, json, time
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Optional, Tuple
+
+# --- modeling ---
+from sklearn.cross_decomposition import PLSRegression
+from sklearn.model_selection import GridSearchCV, KFold, GroupKFold
+from sklearn.metrics import (
+    mean_squared_error,
+    mean_absolute_error,
+    r2_score,
+    max_error,
+    explained_variance_score,
+)
+from sklearn.linear_model import LinearRegression  # mean-level OLS fit on cultivar means
+
+# --- plotting (headless-safe) ---
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ============================
+# Directories / Config
+# ============================
+
+train_data_dir = "../TrainingData"
+val_data_dir   = "../TestingData"
+
+# Optional CV grouping to reduce leakage across augmentations:
+GROUP_CV_BY_CULTIVAR = False  # set True to use GroupKFold by cultivar
+
+# ============================
+# Cultivar maps
+# ============================
+
+cultivar_cys_map = {
+    "AAC_Chrome":    0.3208,
+    "AAC_Lacombe":   0.3428,
+    "AAC_Liscard":   0.3181,
+    "CDC_Amarillo":  0.3834,
+    "CDC_Athabasca": 0.3418,
+    "CDC_Canary":    0.3117,
+    "CDC_Dakota":    0.3293,
+    "CDC_Golden":    0.3536,
+    "CDC_Greenwater":0.3446,
+    "CDC_Inca":      0.3730,
+    "CDC_Jasper":    0.3360,
+    "CDC_Striker":   0.3575,
+    "CDC_Lewochko":  0.3469,
+    "CDC_Meadow":    0.3180,
+    "CDC_Patrick":   0.3626,
+    "CDC_Saffron":   0.3552,
+    "CDC_Spectrum":  0.3948,
+    "CDC_Spruce":    0.3535,
+    "CDC_Tetris":    0.3531,
+    "Redbat88":      0.3194,
+}
+
+# HPLC measurement SDs (optional; used for horizontal error bars)
+# Optional SDs for later
+cultivar_sd_map = {
+    "AAC_Chrome":    0.0146,
+    "AAC_Lacombe":   0.0401,
+    "AAC_Liscard":   0.0601,
+    "CDC_Amarillo":  0.0458,
+    "CDC_Athabasca": 0.0215,
+    "CDC_Canary":    0.0090,
+    "CDC_Dakota":    0.0434,
+    "CDC_Golden":    0.0425,
+    "CDC_Greenwater":0.0086,
+    "CDC_Inca":      0.0266,
+    "CDC_Jasper":    0.0099,
+    "CDC_Striker":   0.0182,
+    "CDC_Lewochko":  0.0539,
+    "CDC_Meadow":    0.0099,
+    "CDC_Patrick":   0.0459,
+    "CDC_Saffron":   0.0319,
+    "CDC_Spectrum":  0.0275,
+    "CDC_Spruce":    0.0028,
+    "CDC_Tetris":    0.0034,
+    "Redbat88":      0.0324,
+}
+
+# Keep your original artifact prefix for compatibility
+out_prefix = "ols_linear_regression"
+
+# ============================
+# Helpers
+# ============================
+
+def find_cultivar_from_filename(filename: str, cultivar_keys: List[str]) -> Optional[str]:
+    """Return cultivar key if filename STARTS WITH that key, else None."""
+    for k in cultivar_keys:
+        if filename.startswith(k):
+            return k
+    return None
+
+def load_dir(
+    dir_path: str,
+    cultivar_cys_map: Dict[str, float],
+    expected_length: Optional[int] = None,
+    return_labels: bool = False
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], int]:
+    """
+    Load *.npy files, match by cultivar prefix, normalize shapes to (N, L).
+    Returns: X, y, labels (or None), L (feature length).
+    """
+    X_list: List[np.ndarray] = []
+    y_list: List[np.ndarray] = []
+    labels_list: List[np.ndarray] = []
+    cultivar_keys = list(cultivar_cys_map.keys())
+
+    paths = sorted(glob.glob(os.path.join(dir_path, "*.npy")))
+    if not paths:
+        print(f"⚠️ No .npy files found in {dir_path}")
+
+    for file_path in paths:
+        filename = os.path.basename(file_path)
+        cultivar = find_cultivar_from_filename(filename, cultivar_keys)
+        if cultivar is None:
+            print(f"⚠️ Skipping unknown file (no cultivar prefix match): {filename}")
+            continue
+
+        cys_value = float(cultivar_cys_map[cultivar])
+        arr = np.load(file_path)
+        arr = np.asarray(arr)
+
+        # Normalize array shapes to (N, L)
+        if arr.ndim == 1:
+            arr = arr[None, :]                # (L,) -> (1, L)
+        elif arr.ndim == 3 and arr.shape[1] == 1:
+            arr = arr[:, 0, :]                # (N, 1, L) -> (N, L)
+        elif arr.ndim != 2:
+            raise ValueError(f"Unexpected array shape {arr.shape} in {filename}")
+
+        L = int(arr.shape[1])
+        if expected_length is None:
+            expected_length = L
+        if L != expected_length:
+            raise ValueError(
+                f"{filename}: length {L} != expected {expected_length}"
+            )
+
+        X_list.append(arr)
+        y_list.append(np.full((arr.shape[0],), cys_value, dtype=float))
+        if return_labels:
+            labels_list.append(np.array([cultivar] * arr.shape[0], dtype=object))
+
+    if not X_list:
+        raise RuntimeError(
+            f"No usable files loaded from {dir_path}. "
+            f"Check cultivar prefixes and maps."
+        )
+
+    X = np.vstack(X_list)
+    y = np.hstack(y_list)
+    if return_labels:
+        labels = np.concatenate(labels_list) if labels_list else np.array([], dtype=object)
+        return X, y, labels, expected_length
+    return X, y, None, expected_length
+
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+    eps = 1e-12
+    y_true = y_true.astype(float).ravel()
+    y_pred = y_pred.astype(float).ravel()
+    mse  = float(mean_squared_error(y_true, y_pred))
+    rmse = float(np.sqrt(mse))
+    mae  = float(mean_absolute_error(y_true, y_pred))
+    r2   = float(r2_score(y_true, y_pred))
+    evs  = float(explained_variance_score(y_true, y_pred))
+    mxe  = float(max_error(y_true, y_pred))
+    if y_true.std() < eps or y_pred.std() < eps:
+        r = float("nan")
+    else:
+        r = float(np.corrcoef(y_true, y_pred)[0, 1])
+    bias = float(np.mean(y_pred - y_true))
+    # Robust MAPE: divide by |y_true| (guard against near zero)
+    mape = float(np.mean(
+        np.abs((y_true - y_pred) / np.maximum(np.abs(y_true), eps))
+    )) * 100.0
+    return dict(MSE=mse, RMSE=rmse, MAE=mae, R2=r2, Pearson_r=r, Bias=bias,
+                MAPE_pct=mape, ExplainedVar=evs, MaxError=mxe)
+
+# ============================
+# Load data
+# ============================
+
+start_time = time.time()
+expected_length: Optional[int] = None
+
+# Train
+X_train, Y_train, train_labels, expected_length = load_dir(
+    train_data_dir, cultivar_cys_map, expected_length=expected_length, return_labels=True
+)
+
+# Val
+X_val, Y_val, val_labels, expected_length = load_dir(
+    val_data_dir, cultivar_cys_map, expected_length=expected_length, return_labels=True
+)
+
+# ============================
+# Fit PLS (CV to pick n_components)
+# ============================
+
+n_features = X_train.shape[1]
+# keep max components modest to avoid overfitting/slow CV
+max_components = max(1, min(25, n_features, X_train.shape[0] - 1))
+
+if GROUP_CV_BY_CULTIVAR and train_labels is not None and len(train_labels) == len(Y_train):
+    groups = train_labels
+    cv = GroupKFold(n_splits=5)
+    param_grid = {"n_components": list(range(1, max_components + 1))}
+    pls = PLSRegression(scale=True)
+    search = GridSearchCV(
+        estimator=pls,
+        param_grid=param_grid,
+        scoring="neg_mean_squared_error",
+        cv=cv.split(X_train, Y_train, groups=groups),
+        n_jobs=-1
+    )
+else:
+    cv = KFold(n_splits=5, shuffle=True, random_state=42)
+    param_grid = {"n_components": list(range(1, max_components + 1))}
+    pls = PLSRegression(scale=False)  # spectroscopy often benefits from scaling; keep False to mirror your setup
+    search = GridSearchCV(
+        estimator=pls,
+        param_grid=param_grid,
+        scoring="neg_mean_squared_error",
+        cv=cv,
+        n_jobs=-1
+    )
+
+search.fit(X_train, Y_train)
+model: PLSRegression = search.best_estimator_
+
+# Save CV results for debugging/record
+cv_df = pd.DataFrame(search.cv_results_)
+cv_df.to_csv(f"{out_prefix}_cv_results.csv", index=False)
+
+ytr_pred = model.predict(X_train).ravel()
+yva_pred = model.predict(X_val).ravel()
+
+# ============================
+# Validation dataframe (per-spectrum)
+# ============================
+
+df_val = pd.DataFrame({
+    "Cultivar": val_labels,
+    "True Cys": Y_val,
+    "Predicted Cys": yva_pred
+})
+assert len(df_val) == len(Y_val) == len(yva_pred), "Length mismatch in validation dataframe"
+df_val.to_csv("test_predictions.csv", index=False)  # keep same filename
+
+# ============================
+# Metrics
+# ============================
+
+train_metrics = compute_metrics(Y_train, ytr_pred)
+val_metrics   = compute_metrics(Y_val,   yva_pred)
+
+metrics = {
+    "train": train_metrics,
+    "val":   val_metrics,
+    "in_dim": int(X_train.shape[1]),
+    "estimator": f"PLSRegression(n_components={model.n_components}, scale={model.scale})",
+    "best_params": search.best_params_,
+    "cv_best_rmse": float((-search.best_score_) ** 0.5),
+}
+with open(f"{out_prefix}_metrics.json", "w") as f:
+    json.dump(metrics, f, indent=2)
+
+print("\n📈 Final Model Performance (Testing/Validation Set):")
+print(f"Best n_components (CV) : {model.n_components}")
+print(f"CV best RMSE           : {metrics['cv_best_rmse']:.6f}")
+print(f"MAE                    : {val_metrics['MAE']:.6f}")
+print(f"RMSE                   : {val_metrics['RMSE']:.6f}")
+print(f"R²                     : {val_metrics['R2']:.6f}")
+print(f"Max Error              : {val_metrics['MaxError']:.6f}")
+print(f"MAPE (%)               : {val_metrics['MAPE_pct']:.6f}")
+print(f"Explained Variance     : {val_metrics['ExplainedVar']:.6f}")
+
+# ============================
+# Plots & CSVs (mirroring your artifacts)
+# ============================
+
+# 1) Indexed Prediction Plot with Absolute Error Bars (VALIDATION)
+plt.figure(figsize=(10, 5))
+indices = np.arange(len(yva_pred))
+errors = np.abs(yva_pred - Y_val)
+plt.errorbar(indices, yva_pred, yerr=errors, fmt='o', alpha=0.7, capsize=3,
+             elinewidth=1.0, label='Prediction ± Abs Error')
+plt.axhline(np.mean(Y_val), linestyle='--', label=f"Mean True Cys = {np.mean(Y_val):.3f}")
+plt.xlabel("Spectrum Index")
+plt.ylabel("Predicted Cys (g/100g)")
+plt.title("Predictions on Testing/Validation Set with Absolute Error Bars")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("indexed_prediction_with_errorbars.png", dpi=200)
+plt.close()
+
+# 2) Single-cultivar CI + histogram (VALIDATION)
+unique_targets = np.unique(Y_val)
+if len(unique_targets) == 1:
+    try:
+        from scipy import stats
+        mean_pred = float(np.mean(yva_pred))
+        std_pred  = float(np.std(yva_pred, ddof=1))
+        n = int(len(yva_pred))
+        confidence_level = 0.90
+        alpha = 1 - confidence_level
+        t_critical = float(stats.t.ppf(1 - alpha/2, df=max(n-1, 1)))
+        margin = t_critical * std_pred / np.sqrt(max(n, 1))
+        ci_lower, ci_upper = mean_pred - margin, mean_pred + margin
+
+        true_cys = float(unique_targets[0])
+
+        print(f"\n📊 Mean Prediction (Single Cultivar)")
+        print(f"Mean: {mean_pred:.6f}")
+        print(f"{int(confidence_level*100)}% CI: [{ci_lower:.6f}, {ci_upper:.6f}] (± {margin:.6f})")
+
+        # Error bar plot with CI
+        plt.figure()
+        plt.errorbar(x=[true_cys], y=[mean_pred],
+                     yerr=[[max(0.0, mean_pred - ci_lower)], [max(0.0, ci_upper - mean_pred)]],
+                     fmt='o', capsize=5, elinewidth=1.2, label=f'Mean ± {int(confidence_level*100)}% CI')
+        try:
+            plt.axline((true_cys, true_cys), slope=1, linestyle='--', label='Ideal')
+        except AttributeError:
+            plt.plot([true_cys-1, true_cys+1], [true_cys-1, true_cys+1], 'k--', label='Ideal')
+        plt.xlabel("True Cys (g/100g)")
+        plt.ylabel("Predicted Mean Cys (g/100g)")
+        plt.title(f"Mean Prediction with {int(confidence_level*100)}% CI (n={n})")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig("mean_prediction_with_CI_singlecultivar.png", dpi=200)
+        plt.close()
+
+        # Histogram of predictions
+        plt.figure()
+        plt.hist(yva_pred, bins=20, edgecolor='black')
+        plt.axvline(mean_pred, linestyle='--', label=f'Mean: {mean_pred:.3f}')
+        plt.axvline(ci_lower, linestyle=':', label=f'{int(confidence_level*100)}% CI')
+        plt.axvline(ci_upper, linestyle=':')
+        plt.title("Distribution of Predictions (Single Cultivar)")
+        plt.xlabel("Predicted Cys (g/100g)")
+        plt.ylabel("Frequency")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig("prediction_distribution_singlecultivar.png", dpi=200)
+        plt.close()
+    except Exception as e:
+        print(f"⚠️ Skipping CI/hist (scipy not available or error): {e}")
+else:
+    print(f"Skipping CI & histogram: test set has {len(Y_val)} spectra "
+          f"or multiple cultivars ({df_val['Cultivar'].nunique()} unique).")
+
+# 3) Separate Error Bars (per-spectrum)
+plt.figure(figsize=(8, 6))
+seen = set()
+for cultivar in df_val["Cultivar"].unique():
+    sub = df_val[df_val["Cultivar"] == cultivar]
+    y_true = sub["True Cys"].to_numpy()
+    y_pred = sub["Predicted Cys"].to_numpy()
+
+    model_error = np.abs(y_pred - y_true)                    # vertical
+    meas_error  = float(cultivar_sd_map.get(str(cultivar), 0.0))  # horizontal
+
+    label = cultivar if cultivar not in seen else "_nolegend_"
+    seen.add(cultivar)
+
+    plt.errorbar(y_true, y_pred, yerr=model_error,
+                 fmt='o', label=label, alpha=0.8, capsize=3, elinewidth=1.2)
+    plt.errorbar(y_true, y_pred, xerr=meas_error,
+                 fmt='none', ecolor='gray', linestyle='dotted',
+                 capsize=2, elinewidth=1.0)
+
+mn = float(min(df_val["True Cys"].min(), df_val["Predicted Cys"].min()))
+mx = float(max(df_val["True Cys"].max(), df_val["Predicted Cys"].max()))
+plt.plot([mn, mx], [mn, mx], 'k--', label="_nolegend_")
+plt.title("Predicted vs. True with Separate Error Bars (Model vs. Measurement)")
+plt.xlabel("True Cys (g/100g)")
+plt.ylabel("Predicted Cys (g/100g)")
+plt.grid(True, alpha=0.2)
+plt.legend(loc='upper left', frameon=True, ncol=1)
+plt.tight_layout()
+plt.savefig("Predicted_vs_True_Separate_Errors.png", dpi=200)
+plt.close()
+
+# 4) Separate Error Bars (MEAN per cultivar) + OLS fit on means
+g = (df_val.groupby("Cultivar")
+       .agg(True_Cys=("True Cys", "first"),
+            Mean_Pred=("Predicted Cys", "mean"),
+            Std_Pred=("Predicted Cys", "std"),
+            N=("Predicted Cys", "size"))
+       .reset_index())
+g["Std_Pred"] = g["Std_Pred"].fillna(0.0)  # N=1 -> std NaN
+
+plt.figure(figsize=(10, 6))
+use_standard_error = False  # True => SD/sqrt(N); False => SD
+
+for _, row in g.iterrows():
+    cultivar = row["Cultivar"]
+    x = float(row["True_Cys"])
+    y = float(row["Mean_Pred"])
+    yerr = float(row["Std_Pred"] / np.sqrt(row["N"]) if use_standard_error else row["Std_Pred"])
+    xerr = float(cultivar_sd_map.get(str(cultivar), 0.0))
+
+    plt.errorbar(x, y, yerr=yerr, fmt='o', capsize=3, elinewidth=1.2,
+                 label=str(cultivar), alpha=0.9)
+    plt.errorbar(x, y, xerr=xerr, fmt='none', ecolor='gray',
+                 linestyle='dotted', capsize=2, elinewidth=1.0)
+
+mn = float(min(g["True_Cys"].min(), g["Mean_Pred"].min()))
+mx = float(max(g["True_Cys"].max(), g["Mean_Pred"].max()))
+ax = plt.gca()
+ax.set_aspect('equal', adjustable='box')
+pad = 0.002
+ax.set_xlim(mn - pad, mx + pad)
+ax.set_ylim(mn - pad, mx + pad)
+ax.plot([mn - pad, mx + pad], [mn - pad, mx + pad], 'k--', label='Ideal (y=x)')
+
+if len(g) >= 2:
+    X_means = g["True_Cys"].to_numpy().reshape(-1, 1)
+    y_means = g["Mean_Pred"].to_numpy()
+    reg = LinearRegression().fit(X_means, y_means)
+    slope = float(reg.coef_[0]); intercept = float(reg.intercept_)
+    x_line = np.linspace(mn - pad, mx + pad, 200)
+    ax.plot(x_line, slope * x_line + intercept, '-', linewidth=2, color='C1',
+            label=f'Fit: y={slope:.3f}x+{intercept:.3f}')
+    r2_means = r2_score(g["True_Cys"], g["Mean_Pred"])     # vs identity
+    r2_fit   = r2_score(y_means, reg.predict(X_means))     # OLS R²
+else:
+    r2_means = float("nan")
+    r2_fit   = float("nan")
+
+y_std   = Y_val.std(ddof=1)
+y_range = Y_val.max() - Y_val.min()
+rmse_val = float(val_metrics["RMSE"])
+
+ax.text(0.02, 0.98, f"R² vs identity = {r2_means:.3f}\nR² of fit = {r2_fit:.3f}",
+        transform=ax.transAxes, ha="left", va="top",
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.7))
+ax.text(0.02, 0.82,
+        f"RMSE/std(y) = {rmse_val / y_std:.3f}\nRMSE/range(y) = {rmse_val / y_range:.3f}",
+        transform=ax.transAxes, ha="left", va="top",
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.7))
+
+plt.title("Mean Predicted vs. True HPLC per Cultivar")
+plt.xlabel("True HPLC Cys (g/100g)")
+plt.ylabel("Mean Predicted Cys (g/100g)")
+plt.grid(True, alpha=0.2)
+ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0, frameon=True)
+plt.tight_layout(rect=(0.0, 0.0, 0.80, 1.0))
+plt.savefig("Predicted_vs_True_Separate_Errors_MEAN.png", dpi=200)
+plt.close()
+
+mae_means  = float(mean_absolute_error(g["True_Cys"], g["Mean_Pred"]))
+rmse_means = float(np.sqrt(mean_squared_error(g["True_Cys"], g["Mean_Pred"])))
+print("\nPer-cultivar mean metrics:")
+print(f"R²(means) : {r2_means:.6f}")
+print(f"MAE(means): {mae_means:.6f}")
+print(f"RMSE(means): {rmse_means:.6f}")
+print("\nNormalized error (per-spectrum):")
+print(f"RMSE / std(y):   {rmse_val / y_std:.3f}")
+print(f"RMSE / range(y): {rmse_val / y_range:.3f}")
+
+# 5) Calibration scatter (val)
+plt.figure(figsize=(6, 6))
+plt.scatter(Y_val, yva_pred, alpha=0.7)
+mn_sc, mx_sc = min(Y_val.min(), yva_pred.min()), max(Y_val.max(), yva_pred.max())
+plt.plot([mn_sc, mx_sc], [mn_sc, mx_sc], 'k--', label='Ideal')
+plt.xlabel("True Cys (g/100g)")
+plt.ylabel("Predicted Cys (g/100g)")
+plt.title("Predicted vs True Cys (Testing/Validation Set)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("calibration_plot_testing_set.png", dpi=200)
+plt.close()
+
+# 6) Bar plot + CSV (per-cultivar means; val)
+g_out = g.copy()
+g_out["Abs_Error"]    = (g_out["Mean_Pred"] - g_out["True_Cys"]).abs()
+g_out["Pct_Error_%"]  = 100.0 * g_out["Abs_Error"] / g_out["True_Cys"]
+g_out["SE_Pred"]      = g_out["Std_Pred"] / np.sqrt(g_out["N"])
+
+cols = ["Cultivar", "True_Cys", "Mean_Pred", "Abs_Error", "Pct_Error_%", "N", "Std_Pred", "SE_Pred"]
+g_out[cols].to_csv("mean_vs_true_by_cultivar.csv", index=False)
+
+use_standard_error = False
+yerr_pred = (g["Std_Pred"] / np.sqrt(g["N"])) if use_standard_error else g["Std_Pred"]
+yerr_pred = yerr_pred.to_numpy()
+yerr_pred = np.where(np.isnan(yerr_pred), 0.0, yerr_pred)  # portable NaN handling
+
+SHOW_HPLC_SD = False
+yerr_true = np.array([cultivar_sd_map.get(str(cv), 0.0) for cv in g["Cultivar"]]) if SHOW_HPLC_SD else None
+
+plt.figure(figsize=(10, 6))
+x = np.arange(len(g))
+bar_w = 0.38
+plt.bar(x - bar_w/2, g["True_Cys"], width=bar_w, label="True (HPLC)",
+        yerr=yerr_true, capsize=3 if SHOW_HPLC_SD else 0)
+plt.bar(x + bar_w/2, g["Mean_Pred"], width=bar_w,
+        label=f"Predicted (mean){' ± SE' if use_standard_error else ' ± SD'}",
+        yerr=yerr_pred, capsize=3)
+plt.xticks(x, g["Cultivar"], rotation=45, ha="right")
+plt.ylabel("Cys (g/100g)")
+plt.title("Mean Predicted vs True (HPLC) per Cultivar")
+plt.grid(axis='y', alpha=0.2)
+plt.legend()
+plt.tight_layout()
+plt.savefig("bar_mean_true_vs_pred.png", dpi=200)
+plt.close()
+print("\nSaved bar plot -> bar_mean_true_vs_pred.png")
+print("Saved per-cultivar summary -> mean_vs_true_by_cultivar.csv")
+
+# 7) “Loss curve” stand-in for PLS: Train vs Val MSE
+plt.figure()
+plt.bar(["Train MSE", "Val MSE"], [train_metrics["MSE"], val_metrics["MSE"]])
+plt.title("Loss (MSE) — PLS (no epochs)")
+plt.ylabel("MSE")
+plt.tight_layout()
+plt.savefig("Model_Loss.png", dpi=200)
+plt.close()
+
+# 8) Full predictions CSV (Train + Val)
+full_pred = pd.DataFrame({
+    "Split":    np.array(["Train"] * len(ytr_pred) + ["Val"] * len(yva_pred)),
+    "Cultivar": np.concatenate([train_labels, val_labels]),
+    "True_Cys": np.concatenate([Y_train, Y_val]),
+    "Pred_Cys": np.concatenate([ytr_pred, yva_pred])
+})
+full_pred.to_csv(f"{out_prefix}_predictions.csv", index=False)
+
+# 9) Coefficients CSV (PLS)
+coef = model.coef_.ravel()
+coef_df = pd.DataFrame({
+    "feature_index": np.arange(len(coef)),
+    "coefficient": coef
+})
+# Intercept: prefer model.intercept_ if present; otherwise derive
+try:
+    intercept_val = float(np.ravel(model.intercept_)[0])
+except Exception:
+    intercept_val = float(np.ravel(model.y_mean_ - model.x_mean_.dot(model.coef_))[0])
+coef_df.loc[len(coef_df)] = {"feature_index": "intercept", "coefficient": intercept_val}
+coef_df.to_csv(f"{out_prefix}_coefficients.csv", index=False)
+
+# 10) Per-cultivar mean comparison CSV (compat)
+comparison_df = g_out[["Cultivar", "True_Cys", "Mean_Pred"]].rename(
+    columns={"True_Cys": "True_Cys", "Mean_Pred": "Pred_Cys"}
+)
+comparison_df["Error"] = comparison_df["Pred_Cys"] - comparison_df["True_Cys"]
+comparison_df.to_csv(f"{out_prefix}_cultivar_prediction_comparison.csv", index=False)
+
+# 11) Also save separate error bars figure with out_prefix name
+def plot_pred_vs_true_with_separate_error_bars(df: pd.DataFrame, targets: np.ndarray, out_prefix: str):
+    fig, ax = plt.subplots(figsize=(8, 6))
+    seen = set()
+    for cultivar in df["Cultivar"].unique():
+        sub = df[df["Cultivar"] == cultivar]
+        y_true = sub["True Cys"].values
+        y_pred = sub["Predicted Cys"].values
+        model_error = np.abs(y_pred - y_true)
+        meas_error = cultivar_sd_map.get(str(cultivar), 0.0)
+
+        label = str(cultivar) if cultivar not in seen else "_nolegend_"
+        seen.add(cultivar)
+
+        ax.errorbar(
+            y_true, y_pred, yerr=model_error,
+            fmt='o', label=label, alpha=0.8,
+            capsize=3, elinewidth=1.2
+        )
+        ax.errorbar(
+            y_true, y_pred, xerr=meas_error,
+            fmt='none', ecolor='gray', linestyle='dotted',
+            capsize=2, elinewidth=1.0
+        )
+
+    lo, hi = float(np.min(targets)), float(np.max(targets))
+    ax.plot([lo, hi], [lo, hi], 'k--', label="_nolegend_")
+    ax.legend(loc='upper left', frameon=True, ncol=1)
+    ax.set_title("Predicted vs. True with Separate Error Bars (Model vs. Measurement)")
+    ax.set_xlabel("True Cys (g/100g)"); ax.set_ylabel("Predicted Cys (g/100g)")
+    fig.tight_layout(); fig.savefig(f"{out_prefix}_Predicted_vs_True_Separate_Errors.png", dpi=200)
+    plt.close(fig)
+
+plot_pred_vs_true_with_separate_error_bars(df_val, Y_val, out_prefix)
+
+# === Wrap up ===
+print("\n==== PLS Regression (prefix-matched cultivars) ====")
+print(f"Input dim: {X_train.shape[1]}")
+print("-- Train metrics --")
+for k in ["MAE", "RMSE", "R2", "MAPE_pct", "ExplainedVar", "MaxError"]:
+    print(f"{k}: {train_metrics[k]:.6f}")
+print("-- Val metrics --")
+for k in ["MAE", "RMSE", "R2", "MAPE_pct", "ExplainedVar", "MaxError"]:
+    print(f"{k}: {val_metrics[k]:.6f}")
+print(f"Artifacts written with prefix: {out_prefix}")
+print(f"⏱️ Total run time: {time.time() - start_time:.2f} seconds")
