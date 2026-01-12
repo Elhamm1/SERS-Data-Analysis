@@ -1,0 +1,376 @@
+# ===== 1D-CNN SERS Cys — Scan-count sweep with augmentation & printed metrics only =====
+import os, glob, time, random
+import numpy as np
+import pandas as pd
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.cuda.amp import autocast, GradScaler
+from torch.utils.data import Dataset, DataLoader
+
+from sklearn.metrics import (
+    mean_absolute_error, mean_squared_error, r2_score, max_error,
+    mean_absolute_percentage_error, explained_variance_score
+)
+
+# -----------------------------
+# Parameters (edit if needed)
+# -----------------------------
+input_length   = 1496
+train_data_dir = "../TrainingData"
+test_data_dir  = "../TestingData"
+
+num_epochs   = 100
+batch_size   = 32
+lr           = 1e-4
+weight_decay = 1e-4
+use_amp      = True
+
+# Reference scan-count for baseline noise (assumed your averaged spectra)
+base_scan_count = 512
+# Scan counts to sweep:
+scan_counts = [64,32, 16, 8, 4, 2, 1]
+
+# Augmentation
+num_augments = 100
+
+# Sampling per cultivar
+n_train_per_cultivar = 8
+n_test_per_cultivar  = 2
+
+# Reproducibility
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+# === Cultivar labels (values = true Cys for that cultivar) ===
+cultivar_cys_map = {
+    "AAC_Chrome":    0.3208,
+    "AAC_Lacombe":   0.3428,
+    "AAC_Liscard":   0.3181,
+    "CDC_Amarillo":  0.3834,
+    "CDC_Athabasca": 0.3418,
+    "CDC_Canary":    0.3117,
+    "CDC_Dakota":    0.3293,
+    "CDC_Golden":    0.3536,
+    "CDC_Greenwater":0.3446,
+    "CDC_Inca":      0.3730,
+    "CDC_Jasper":    0.3360,
+    "CDC_Striker":   0.3575,
+    "CDC_Lewochko":  0.3469,
+    "CDC_Meadow":    0.3180,
+    "CDC_Patrick":   0.3626,
+    "CDC_Saffron":   0.3552,
+    "CDC_Spectrum":  0.3948,
+    "CDC_Spruce":    0.3535,
+    "CDC_Tetris":    0.3531,
+    "Redbat88":      0.3194,
+}
+
+# ============================
+# Utilities
+# ============================
+def find_cultivar_from_filename(filename: str, cultivar_keys):
+    for key in cultivar_keys:
+        if filename.startswith(key):
+            return key
+    return None
+
+def list_npy_by_cultivar(dir_path: str, cultivar_cys_map: dict):
+    paths = sorted(glob.glob(os.path.join(dir_path, "*locL*.npy")))
+    out = {cv: [] for cv in cultivar_cys_map.keys()}
+    for p in paths:
+        cv = find_cultivar_from_filename(os.path.basename(p), cultivar_cys_map.keys())
+        if cv is not None:
+            out[cv].append(p)
+    return out
+
+def load_npy(path: str, input_len: int):
+    arr = np.load(path)
+    arr = np.asarray(arr)
+    # normalize shapes -> (N, L)
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    elif arr.ndim == 3 and arr.shape[1] == 1:
+        arr = arr[:, 0, :]
+    elif arr.ndim != 2:
+        raise ValueError(f"Unexpected array shape {arr.shape} in {os.path.basename(path)}")
+    if arr.shape[1] != input_len:
+        raise ValueError(f"File {os.path.basename(path)} length {arr.shape[1]} != {input_len}")
+    return arr
+
+def load_and_stack(paths):
+    X_list, y_list = [], []
+    for p in paths:
+        arr = load_npy(p, input_length)  # (N, L)
+        cv  = find_cultivar_from_filename(os.path.basename(p), cultivar_cys_map.keys())
+        if cv is None:
+            continue
+        cys = cultivar_cys_map[cv]
+        X_list.append(arr)
+        y_list.append(np.full((arr.shape[0],), cys, dtype=float))
+    if not X_list:
+        raise RuntimeError("No usable arrays loaded; check filenames & cultivar prefixes.")
+    X = np.vstack(X_list)
+    y = np.hstack(y_list)
+    return X, y
+
+def robust_baseline_noise(signal: np.ndarray) -> float:
+    """
+    Baseline noise via simple smoothing (moving average) and 1.4826*MAD of residuals.
+    """
+    w = 21
+    if w >= len(signal):
+        w = max(3, (len(signal)//2)*2 - 1)
+    smooth = np.convolve(signal, np.ones(w)/w, mode='same')
+    resid  = signal - smooth
+    mad = np.median(np.abs(resid - np.median(resid)))
+    return 1.4826 * mad
+
+def compute_baseline_noise_from_samples(X_samples: np.ndarray) -> float:
+    noises = [robust_baseline_noise(x) for x in X_samples]
+    return float(np.mean(noises))
+
+def augment_array(signal: np.ndarray, noise_std: float, n_aug: int) -> np.ndarray:
+    L = signal.shape[-1]
+    noise = np.random.normal(0.0, noise_std, size=(n_aug, L))
+    return signal[None, :] + noise
+
+# ============================
+# Model & Dataset
+# ============================
+class Cys1DCNN(nn.Module):
+    def __init__(self, input_length=1496):
+        super(Cys1DCNN, self).__init__()
+        self.conv1 = nn.Conv1d(1, 16, kernel_size=5, padding=2)
+        self.bn1   = nn.BatchNorm1d(16)
+        self.pool1 = nn.MaxPool1d(2)
+
+        self.conv2 = nn.Conv1d(16, 32, kernel_size=5, padding=2)
+        self.bn2   = nn.BatchNorm1d(32)
+        self.pool2 = nn.MaxPool1d(2)
+
+        self.conv3 = nn.Conv1d(32, 64, kernel_size=5, padding=2)
+        self.bn3   = nn.BatchNorm1d(64)
+        self.pool3 = nn.MaxPool1d(2)
+
+        self.conv4 = nn.Conv1d(64, 128, kernel_size=5, padding=2)
+        self.bn4   = nn.BatchNorm1d(128)
+        self.pool4 = nn.MaxPool1d(2)
+
+        self.flattened_size = (input_length // 16) * 128
+        self.fc1     = nn.Linear(self.flattened_size, 128)
+        self.dropout = nn.Dropout(0.3)
+        self.fc2     = nn.Linear(128, 1)
+
+    def forward(self, x):
+        x = self.pool1(F.relu(self.bn1(self.conv1(x))))
+        x = self.pool2(F.relu(self.bn2(self.conv2(x))))
+        x = self.pool3(F.relu(self.bn3(self.conv3(x))))
+        x = self.pool4(F.relu(self.bn4(self.conv4(x))))
+        x = x.view(-1, self.flattened_size)
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        return self.fc2(x)
+
+class SpectraDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32).unsqueeze(1)
+        self.y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
+    def __len__(self):  return len(self.X)
+    def __getitem__(self, idx): return self.X[idx], self.y[idx]
+
+def build_loaders(X_train_aug, y_train_aug, X_test, y_test, batch_size):
+    train_loader = DataLoader(SpectraDataset(X_train_aug, y_train_aug), batch_size=batch_size, shuffle=True)
+    test_loader  = DataLoader(SpectraDataset(X_test,      y_test),      batch_size=batch_size, shuffle=False)
+    return train_loader, test_loader
+
+def train_one_setting(scan_count, baseline_noise, X_train_raw, y_train_raw, X_test_raw, y_test_raw):
+    """Augment, train, evaluate and print metrics for a given scan_count."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # === Augmentation for this scan_count ===
+    noise_std = baseline_noise * np.sqrt(base_scan_count / scan_count)
+    augmented_blocks, augmented_targets = [], []
+    for i in range(X_train_raw.shape[0]):
+        sig = X_train_raw[i]
+        aug = augment_array(sig, noise_std=noise_std, n_aug=num_augments)  # (100, L)
+        augmented_blocks.append(aug)
+        augmented_targets.append(np.full((num_augments,), y_train_raw[i], dtype=float))
+    X_train_aug = np.vstack(augmented_blocks)
+    y_train_aug = np.hstack(augmented_targets)
+    X_test, y_test = X_test_raw, y_test_raw
+
+    # === Model, loss, opt, sched
+    model = Cys1DCNN(input_length).to(device)
+    criterion = nn.SmoothL1Loss(beta=0.02)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    train_loader, test_loader = build_loaders(X_train_aug, y_train_aug, X_test, y_test, batch_size)
+
+    steps_per_epoch = max(1, len(train_loader))
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=lr * 10.0,
+        epochs=num_epochs,
+        steps_per_epoch=steps_per_epoch,
+        pct_start=0.15,
+        anneal_strategy="cos",
+        div_factor=10.0,
+        final_div_factor=1e4
+    )
+    scaler = GradScaler(enabled=(device.type == "cuda" and use_amp))
+
+    # === Train
+    best_state = None
+    best_loss  = float('inf')
+
+    print("\n" + "="*72)
+    print(f"SCAN_COUNT = {scan_count} | noise_std = {noise_std:.6f}  (baseline_noise={baseline_noise:.6f})")
+    print("="*72)
+
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss = 0.0
+        for Xb, yb in train_loader:
+            Xb, yb = Xb.to(device), yb.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(enabled=(device.type == "cuda" and use_amp)):
+                out  = model(Xb)
+                loss = criterion(out, yb)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            total_loss += loss.item() * Xb.size(0)
+        epoch_train_loss = total_loss / len(train_loader.dataset)
+
+        # Eval
+        model.eval()
+        total_tloss = 0.0
+        with torch.no_grad(), autocast(enabled=(device.type == "cuda" and use_amp)):
+            for Xb, yb in test_loader:
+                Xb, yb = Xb.to(device), yb.to(device)
+                out = model(Xb)
+                total_tloss += criterion(out, yb).item() * Xb.size(0)
+        epoch_test_loss = total_tloss / len(test_loader.dataset)
+
+#        print(f"Epoch {epoch+1:3d}/{num_epochs} | Train Loss: {epoch_train_loss:.6f} | Test Loss: {epoch_test_loss:.6f}")
+
+        if epoch_test_loss < best_loss:
+            best_loss  = epoch_test_loss
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+    # === Final eval with best weights
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    def eval_loader(loader):
+        preds, targs = [], []
+        with torch.no_grad(), autocast(enabled=(device.type == "cuda" and use_amp)):
+            for Xb, yb in loader:
+                Xb = Xb.to(device)
+                preds.append(model(Xb).cpu())
+                targs.append(yb)
+        preds = torch.cat(preds).squeeze().numpy()
+        targs = torch.cat(targs).squeeze().numpy()
+        return preds, targs
+
+    # Training metrics (on augmented training set)
+    train_loader_eval = DataLoader(SpectraDataset(X_train_aug, y_train_aug), batch_size=batch_size, shuffle=False)
+    preds_tr, t_tr = eval_loader(train_loader_eval)
+    mae_tr  = mean_absolute_error(t_tr, preds_tr)
+    rmse_tr = np.sqrt(mean_squared_error(t_tr, preds_tr))
+    r2_tr   = r2_score(t_tr, preds_tr)
+
+    # Testing metrics
+    preds_te, t_te = eval_loader(test_loader)
+    mae_te  = mean_absolute_error(t_te, preds_te)
+    rmse_te = np.sqrt(mean_squared_error(t_te, preds_te))
+    r2_te   = r2_score(t_te, preds_te)
+
+    print("\n📈 Final Model Performance (TRAINING Set on augmented data):")
+    print(f"MAE  : {mae_tr:.6f}")
+    print(f"RMSE : {rmse_tr:.6f}")
+    print(f"R²   : {r2_tr:.6f}")
+    print(f"Max Error          : {max_error(t_tr, preds_tr):.6f}")
+    print(f"MAPE               : {mean_absolute_percentage_error(t_tr, preds_tr):.6f}")
+    print(f"Explained Variance : {explained_variance_score(t_tr, preds_tr):.6f}")
+
+    print("\n📈 Final Model Performance (TESTING Set):")
+    print(f"MAE  : {mae_te:.6f}")
+    print(f"RMSE : {rmse_te:.6f}")
+    print(f"R²   : {r2_te:.6f}")
+    print(f"Max Error          : {max_error(t_te, preds_te):.6f}")
+    print(f"MAPE               : {mean_absolute_percentage_error(t_te, preds_te):.6f}")
+    print(f"Explained Variance : {explained_variance_score(t_te, preds_te):.6f}")
+
+    # Per-cultivar MEAN metrics (testing set)
+    cys_to_cultivar = {np.float32(v).item(): k for k, v in cultivar_cys_map.items()}
+    df_test = pd.DataFrame({"True Cys": t_te, "Predicted Cys": preds_te})
+    df_test["Cultivar"] = df_test["True Cys"].astype(np.float32).map(cys_to_cultivar)
+
+    g = (df_test.groupby("Cultivar")
+         .agg(True_Cys=("True Cys", "first"),
+              Mean_Pred=("Predicted Cys", "mean"))
+         .reset_index())
+    r2_means   = r2_score(g["True_Cys"], g["Mean_Pred"]) if len(g) >= 2 else np.nan
+    mae_means  = mean_absolute_error(g["True_Cys"], g["Mean_Pred"])
+    rmse_means = np.sqrt(mean_squared_error(g["True_Cys"], g["Mean_Pred"]))
+
+    print("\n📊 Per-cultivar Mean Metrics (TESTING):")
+    print(f"R²(means) : {r2_means:.6f}" if not np.isnan(r2_means) else "R²(means) : NaN (need ≥2 cultivars)")
+    print(f"MAE(means): {mae_means:.6f}")
+    print(f"RMSE(means): {rmse_means:.6f}")
+
+    # Also echo baseline & noise
+    print(f"\nBaseline noise (estimated once from sampled train): {baseline_noise:.6f}")
+    print(f"Augmentation noise_std used for scan_count={scan_count} (base={base_scan_count}): {noise_std:.6f}")
+
+# ============================
+# 1) Sample the data once (fixed across scan_counts)
+# ============================
+train_by_cv = list_npy_by_cultivar(train_data_dir, cultivar_cys_map)
+test_by_cv  = list_npy_by_cultivar(test_data_dir,  cultivar_cys_map)
+
+sampled_train_paths, sampled_test_paths = [], []
+for cv, paths in train_by_cv.items():
+    if not paths: continue
+    sampled_train_paths.extend(random.sample(paths, min(n_train_per_cultivar, len(paths))))
+for cv, paths in test_by_cv.items():
+    if not paths: continue
+    sampled_test_paths.extend(random.sample(paths, min(n_test_per_cultivar, len(paths))))
+
+if not sampled_train_paths:
+    raise RuntimeError("No training files sampled. Check TrainingData folder & names.")
+if not sampled_test_paths:
+    raise RuntimeError("No testing files sampled. Check TestingData folder & names.")
+
+X_train_raw, y_train_raw = load_and_stack(sampled_train_paths)
+X_test_raw,  y_test_raw  = load_and_stack(sampled_test_paths)
+
+# ============================
+# 2) Baseline noise (once, from sampled training spectra)
+# ============================
+baseline_noise = compute_baseline_noise_from_samples(X_train_raw)
+print(f"\nEstimated baseline_noise (from sampled train spectra): {baseline_noise:.6f}")
+print(f"Train (raw) shape: {X_train_raw.shape} ; Test (raw) shape: {X_test_raw.shape}")
+
+# ============================
+# 3) Loop over scan_counts
+# ============================
+for sc in scan_counts:
+    train_one_setting(
+        scan_count=sc,
+        baseline_noise=baseline_noise,
+        X_train_raw=X_train_raw, y_train_raw=y_train_raw,
+        X_test_raw=X_test_raw,   y_test_raw=y_test_raw
+    )
