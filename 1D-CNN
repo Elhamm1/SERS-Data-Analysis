@@ -1,0 +1,543 @@
+# ===== Cys-from-SERS with Simple 1D-CNN =====
+
+import os
+import glob
+import time
+import random
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.cm import get_cmap
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.cuda.amp import autocast, GradScaler
+from torch.utils.data import Dataset, DataLoader
+
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+    max_error,
+    mean_absolute_percentage_error,
+    explained_variance_score
+)
+from matplotlib.lines import Line2D
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score
+
+# === Parameters ===
+input_length = 1496
+train_data_dir = "../TrainingData"
+test_data_dir  = "../TestingData"
+num_epochs = 100
+batch_size = 32
+lr = 1e-4
+patience = 10
+factor = 0.5
+
+# === Reproducibility ===
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+# === Cultivar labels (values = true Cys for that cultivar) ===
+cultivar_cys_map = {
+    "AAC_Chrome":    0.3208,
+    "AAC_Lacombe":   0.3428,
+    "AAC_Liscard":   0.3181,
+    "CDC_Amarillo":  0.3834,
+    "CDC_Athabasca": 0.3418,
+    "CDC_Canary":    0.3117,
+    "CDC_Dakota":    0.3293,
+    "CDC_Golden":    0.3536,
+    "CDC_Greenwater":0.3446,
+    "CDC_Inca":      0.3730,
+    "CDC_Jasper":    0.3360,
+    "CDC_Striker":   0.3575,
+    "CDC_Lewochko":  0.3469,
+    "CDC_Meadow":    0.3180,
+    "CDC_Patrick":   0.3626,
+    "CDC_Saffron":   0.3552,
+    "CDC_Spectrum":  0.3948,
+    "CDC_Spruce":    0.3535,
+    "CDC_Tetris":    0.3531,
+    "Redbat88":      0.3194,
+}
+
+# Optional SDs for later
+cultivar_sd_map = {
+    "AAC_Chrome":    0.0146,
+    "AAC_Lacombe":   0.0401,
+    "AAC_Liscard":   0.0601,
+    "CDC_Amarillo":  0.0458,
+    "CDC_Athabasca": 0.0215,
+    "CDC_Canary":    0.0090,
+    "CDC_Dakota":    0.0434,
+    "CDC_Golden":    0.0425,
+    "CDC_Greenwater":0.0086,
+    "CDC_Inca":      0.0266,
+    "CDC_Jasper":    0.0099,
+    "CDC_Striker":   0.0182,
+    "CDC_Lewochko":  0.0539,
+    "CDC_Meadow":    0.0099,
+    "CDC_Patrick":   0.0459,
+    "CDC_Saffron":   0.0319,
+    "CDC_Spectrum":  0.0275,
+    "CDC_Spruce":    0.0028,
+    "CDC_Tetris":    0.0034,
+    "Redbat88":      0.0324,
+}
+
+palette = list(get_cmap('tab20').colors)  # 20 discrete colors
+ordered_cultivars = list(cultivar_cys_map.keys())  
+cultivar_color = {cv: palette[i % len(palette)] for i, cv in enumerate(ordered_cultivars)}
+
+# === Model  ===
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Cys1DCNN(nn.Module):
+    def __init__(self, input_length=1496):
+        super(Cys1DCNN, self).__init__()
+        self.conv1 = nn.Conv1d(1, 16, kernel_size=5, padding=2)
+        self.bn1 = nn.BatchNorm1d(16)
+        self.pool1 = nn.MaxPool1d(2)
+
+        self.conv2 = nn.Conv1d(16, 32, kernel_size=5, padding=2)
+        self.bn2 = nn.BatchNorm1d(32)
+        self.pool2 = nn.MaxPool1d(2)
+
+        self.conv3 = nn.Conv1d(32, 64, kernel_size=5, padding=2)
+        self.bn3 = nn.BatchNorm1d(64)
+        self.pool3 = nn.MaxPool1d(2)
+
+        self.conv4 = nn.Conv1d(64, 128, kernel_size=5, padding=2)
+        self.bn4 = nn.BatchNorm1d(128)
+        self.pool4 = nn.MaxPool1d(2)
+
+        self.flattened_size = (input_length // 16) * 128
+        self.fc1 = nn.Linear(self.flattened_size, 128)
+        self.dropout = nn.Dropout(0.3)
+        self.fc2 = nn.Linear(128, 1)
+
+    def forward(self, x):
+        x = self.pool1(F.relu(self.bn1(self.conv1(x))))
+        x = self.pool2(F.relu(self.bn2(self.conv2(x))))
+        x = self.pool3(F.relu(self.bn3(self.conv3(x))))
+        x = self.pool4(F.relu(self.bn4(self.conv4(x)))) 
+        x = x.view(-1, self.flattened_size)
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        return self.fc2(x)
+
+# === Dataset Class ===
+class SpectraDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32).unsqueeze(1)
+        self.y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+# === Helpers to load files by cultivar prefix ===
+def find_cultivar_from_filename(filename: str, cultivar_keys):
+    for key in cultivar_keys:
+        if filename.startswith(key):
+            return key
+    return None
+
+def load_dir(dir_path: str, cultivar_cys_map: dict, input_length: int):
+    X_list, y_list = [], []
+    cultivar_keys = list(cultivar_cys_map.keys())
+
+    paths = sorted(glob.glob(os.path.join(dir_path, "*.npy")))
+    if len(paths) == 0:
+        print(f"⚠️ No .npy files found in {dir_path}")
+
+    for file_path in paths:
+        filename = os.path.basename(file_path)
+        cultivar = find_cultivar_from_filename(filename, cultivar_keys)
+
+        if cultivar is None:
+            print(f"⚠️ Skipping unknown file (no cultivar prefix match): {filename}")
+            continue
+
+        cys_value = cultivar_cys_map[cultivar]
+        arr = np.load(file_path)
+        arr = np.asarray(arr)
+
+        # Standardize shapes
+        if arr.ndim == 1:
+            arr = arr[None, :]
+        elif arr.ndim == 3 and arr.shape[1] == 1:
+            arr = arr[:, 0, :]
+        elif arr.ndim != 2:
+            raise ValueError(f"Unexpected array shape {arr.shape} in {filename}")
+
+        if arr.shape[1] != input_length:
+            raise ValueError(
+                f"File {filename} has length {arr.shape[1]} != expected {input_length}"
+            )
+
+        X_list.append(arr)
+        y_list.append(np.full((arr.shape[0],), cys_value, dtype=float))
+
+    if len(X_list) == 0:
+        raise RuntimeError(
+            f"No usable files loaded from {dir_path}. "
+            f"Check cultivar prefixes and maps."
+        )
+
+    X = np.vstack(X_list)
+    y = np.hstack(y_list)
+    return X, y
+
+# === Load Data ===
+X_train, Y_train = load_dir(train_data_dir, cultivar_cys_map, input_length)
+X_test,   Y_test   = load_dir(test_data_dir,   cultivar_cys_map, input_length)
+
+# === DataLoaders ===
+train_loader = DataLoader(SpectraDataset(X_train, Y_train), batch_size=batch_size, shuffle=True)
+test_loader   = DataLoader(SpectraDataset(X_test,   Y_test),   batch_size=batch_size, shuffle=False)
+
+# === Training Setup (AdamW + OneCycleLR + AMP + Huber-like SmoothL1) ===
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = Cys1DCNN(input_length).to(device)
+criterion = nn.SmoothL1Loss(beta=0.02)
+optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+
+steps_per_epoch = max(1, len(train_loader))
+scheduler = optim.lr_scheduler.OneCycleLR(
+    optimizer,
+    max_lr=lr * 10.0,
+    epochs=num_epochs,
+    steps_per_epoch=steps_per_epoch,
+    pct_start=0.15,
+    anneal_strategy="cos",
+    div_factor=10.0,
+    final_div_factor=1e4
+)
+
+scaler = GradScaler(enabled=(device.type == "cuda"))
+
+train_losses, test_losses = [], []
+best_loss = float('inf')
+start_time = time.time()
+
+# === Training Loop ===
+for epoch in range(num_epochs):
+    model.train()
+    total_loss = 0.0
+    for X_batch, y_batch in train_loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        with autocast(enabled=(device.type == "cuda")):
+            output = model(X_batch)
+            loss = criterion(output, y_batch)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+        total_loss += loss.item() * X_batch.size(0)
+
+    epoch_train_loss = total_loss / len(train_loader.dataset)
+    train_losses.append(epoch_train_loss)
+
+    # Testing
+    model.eval()
+    test_loss = 0.0
+    with torch.no_grad(), autocast(enabled=(device.type == "cuda")):
+        for X_batch, y_batch in test_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            output = model(X_batch)
+            test_loss += criterion(output, y_batch).item() * X_batch.size(0)
+
+    epoch_test_loss = test_loss / len(test_loader.dataset)
+    test_losses.append(epoch_test_loss)
+
+    print(f"Epoch {epoch+1}/{num_epochs} | "
+          f"Train Loss: {epoch_train_loss:.6f} | "
+          f"Test Loss: {epoch_test_loss:.6f}")
+
+    if epoch_test_loss < best_loss:
+        best_loss = epoch_test_loss
+        torch.save(model.state_dict(), "best_model.pth")
+
+print(f"⏱️ Total run time: {time.time() - start_time:.2f} seconds")
+
+# === Evaluation ===
+model.load_state_dict(torch.load("best_model.pth", map_location=device))
+model.eval()
+
+preds, targets = [], []
+with torch.no_grad(), autocast(enabled=(device.type == "cuda")):
+    for X_batch, y_batch in test_loader:
+        X_batch = X_batch.to(device)
+        preds.append(model(X_batch).cpu())
+        targets.append(y_batch)
+
+preds = torch.cat(preds).squeeze().numpy()
+targets = torch.cat(targets).squeeze().numpy()
+
+# === If the test set is a single cultivar, compute CI + histogram ===
+unique_targets = np.unique(targets)
+if len(unique_targets) == 1:
+    from scipy import stats
+    mean_pred = np.mean(preds)
+    std_pred = np.std(preds, ddof=1)
+    n = len(preds)
+
+    confidence_level = 0.90
+    alpha = 1 - confidence_level
+    t_critical = stats.t.ppf(1 - alpha/2, df=n-1)
+    margin = t_critical * std_pred / np.sqrt(n)
+    ci_lower, ci_upper = mean_pred - margin, mean_pred + margin
+
+    true_cys = unique_targets[0]
+    cultivar_label = [k for k, v in cultivar_cys_map.items() if abs(v - true_cys) < 1e-6]
+    cultivar_name = cultivar_label[0] if cultivar_label else "Unknown"
+
+    print(f"\n📊 Mean Prediction (Cultivar {cultivar_name})")
+    print(f"Mean: {mean_pred:.6f}")
+    print(f"{int(confidence_level*100)}% CI: [{ci_lower:.6f}, {ci_upper:.6f}] (± {margin:.6f})")
+
+    # Error bar plot with CI
+    plt.figure()
+    plt.errorbar(x=[true_cys], y=[mean_pred],
+                 yerr=[[mean_pred - ci_lower], [ci_upper - mean_pred]],
+                 fmt='o', capsize=5, label=f'Mean ± {int(confidence_level*100)}% CI')
+    plt.axline((true_cys, true_cys), slope=1, linestyle='--', label='Ideal')
+    plt.xlabel("True Cys (g/100g)")
+    plt.ylabel("Predicted Mean Cys (g/100g)")
+    plt.title(f"Mean Prediction with {int(confidence_level*100)}% CI (n={n})")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("mean_prediction_with_CI_singlecultivar.png")
+    plt.close()
+
+    # Histogram of predictions
+    plt.figure()
+    plt.hist(preds, bins=20, edgecolor='black')
+    plt.axvline(mean_pred, linestyle='--', label=f'Mean: {mean_pred:.3f}')
+    plt.axvline(ci_lower, linestyle=':', label=f'{int(confidence_level*100)}% CI')
+    plt.axvline(ci_upper, linestyle=':')
+    plt.title("Distribution of Predictions (Single Cultivar)")
+    plt.xlabel("Predicted Cys (g/100g)")
+    plt.ylabel("Frequency")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("prediction_distribution_singlecultivar.png")
+    plt.close()
+else:
+    print(f"Skipping CI & histogram: test set has {len(targets)} spectra "
+          f"or multiple cultivars ({len(unique_targets)} unique Cys values).")
+
+# === Metrics ===
+mae  = mean_absolute_error(targets, preds)
+rmse = np.sqrt(mean_squared_error(targets, preds))
+r2   = r2_score(targets, preds)
+
+print("\n📈 Final Model Performance (Testing Set):")
+print(f"MAE                 : {mae:.6f}")
+print(f"RMSE                : {rmse:.6f}")
+print(f"R²                  : {r2:.6f}")
+print(f"Max Error           : {max_error(targets, preds):{'.6f'}}")
+print(f"MAPE                : {mean_absolute_percentage_error(targets, preds):.6f}")
+print(f"Explained Variance  : {explained_variance_score(targets, preds):.6f}")
+
+# === Create a small results table ===
+df = pd.DataFrame({"True Cys": targets, "Predicted Cys": preds})
+
+# exact value → name mapping with matching precision
+cys_to_cultivar = {np.float32(v).item(): k for k, v in cultivar_cys_map.items()}
+df["Cultivar"] = df["True Cys"].astype(np.float32).map(cys_to_cultivar)
+
+df.to_csv("test_predictions.csv", index=False)
+
+# === Separate Error Bars (Model vs Measurement) ===
+plt.figure(figsize=(8, 6))
+seen = set()
+for cultivar in ordered_cultivars:  # stable order => stable colors
+    sub = df[df["Cultivar"] == cultivar]
+    if sub.empty:
+        continue
+    y_true = sub["True Cys"].to_numpy()
+    y_pred = sub["Predicted Cys"].to_numpy()
+
+    model_error = np.abs(y_pred - y_true)
+
+    label = cultivar if cultivar not in seen else "_nolegend_"
+    seen.add(cultivar)
+
+    col = cultivar_color.get(cultivar)
+    plt.errorbar(y_true, y_pred, yerr=model_error,
+                 fmt='o', color=col, ecolor=col,
+                 label=label, alpha=0.9, capsize=3, elinewidth=1.2)
+
+    # keep your dotted overlay in neutral gray
+    plt.errorbar(y_true, y_pred, fmt='none',
+                 ecolor='gray', linestyle='dotted',
+                 capsize=2, elinewidth=1.0)
+
+mn = float(min(df["True Cys"].min(), df["Predicted Cys"].min()))
+mx = float(max(df["True Cys"].max(), df["Predicted Cys"].max()))
+plt.plot([mn, mx], [mn, mx], 'k--', label="_nolegend_")
+plt.title("Predicted vs. True with Separate Error Bars (Model vs. Measurement)")
+plt.xlabel("True Cys (g/100g)")
+plt.ylabel("Predicted Cys (g/100g)")
+plt.grid(True, alpha=0.2)
+plt.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0, frameon=True)
+plt.tight_layout()
+plt.savefig("Predicted_vs_True_Separate_Errors.png")
+plt.close()
+
+# === Separate Error Bars (MEAN per cultivar) ===
+g = (df.groupby("Cultivar")
+       .agg(True_Cys=("True Cys", "first"),
+            Mean_Pred=("Predicted Cys", "mean"),
+            Std_Pred=("Predicted Cys", "std"),
+            N=("Predicted Cys", "size"))
+       .reset_index())
+
+plt.figure(figsize=(10, 6))
+use_standard_error = False  # True => show SE; False => SD
+
+for _, row in g.iterrows():
+    cultivar = row["Cultivar"]
+    x = float(row["True_Cys"])
+    y = float(row["Mean_Pred"])
+    yerr = float(row["Std_Pred"] / np.sqrt(row["N"]) if use_standard_error else row["Std_Pred"])
+
+    col = cultivar_color.get(cultivar)
+
+    plt.errorbar(x, y, yerr=yerr, fmt='o',
+                 color=col, ecolor=col,
+                 capsize=3, elinewidth=1.2,
+                 label=cultivar, alpha=0.9)
+
+    # keep the dotted neutral overlay
+    plt.errorbar(x, y, fmt='none', ecolor='gray',
+                 linestyle='dotted', capsize=2, elinewidth=1.0)
+
+mn = float(min(g["True_Cys"].min(), g["Mean_Pred"].min()))
+mx = float(max(g["True_Cys"].max(), g["Mean_Pred"].max()))
+ax = plt.gca()
+ax.set_aspect('equal', adjustable='box')
+pad = 0.002
+ax.set_xlim(mn - pad, mx + pad)
+ax.set_ylim(mn - pad, mx + pad)
+ax.plot([mn - pad, mx + pad], [mn - pad, mx + pad], 'k--', label='Ideal (y=x)')
+
+X = g["True_Cys"].to_numpy().reshape(-1, 1)
+y = g["Mean_Pred"].to_numpy()
+reg = LinearRegression().fit(X, y)
+slope = float(reg.coef_[0])
+intercept = float(reg.intercept_)
+x_line = np.linspace(mn - pad, mx + pad, 200)
+ax.plot(x_line, slope * x_line + intercept, '-', linewidth=2, color='C1',
+        label=f'Fit: y={slope:.3f}x+{intercept:.3f}')
+
+r2_means = r2_score(g["True_Cys"], g["Mean_Pred"])
+r2_fit   = r2_score(y, reg.predict(X))
+
+y_std   = targets.std(ddof=1)
+y_range = targets.max() - targets.min()
+rmse    = np.sqrt(mean_squared_error(targets, preds))
+
+plt.title("Mean Predicted vs True HPLC per Cultivar")
+plt.xlabel("True HPLC Cys (g/100g)")
+plt.ylabel("Mean Predicted Cys (g/100g)")
+plt.grid(False, alpha=0.2)
+ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0, frameon=True)
+plt.tight_layout(rect=(0.0, 0.0, 0.80, 1.0))
+plt.savefig("Predicted_vs_True_Separate_Errors_MEAN.png")
+plt.close()
+
+# --- Mean-level metrics + bar chart ---
+mae_means  = mean_absolute_error(g["True_Cys"], g["Mean_Pred"])
+rmse_means = np.sqrt(mean_squared_error(g["True_Cys"], g["Mean_Pred"]))
+print("\nPer-cultivar mean metrics:")
+print(f"R²(means) : {r2_means:.6f}")
+print(f"MAE(means): {mae_means:.6f}")
+print(f"RMSE(means): {rmse_means:.6f}")
+
+print("\nNormalized error (per-spectrum):")
+print(f"RMSE / std(y):   {rmse / y_std:.3f}")
+print(f"RMSE / range(y): {rmse / y_range:.3f}")
+
+# Bar plot: mean Predicted vs True (per cultivar)
+if 'use_standard_error' not in globals():
+    use_standard_error = False
+yerr_pred = (g["Std_Pred"] / np.sqrt(g["N"])) if use_standard_error else g["Std_Pred"]
+yerr_pred = np.nan_to_num(yerr_pred.to_numpy(), nan=0.0)
+SHOW_HPLC_SD = False
+yerr_true = np.array([cultivar_sd_map.get(cv, 0.0) for cv in g["Cultivar"]]) if SHOW_HPLC_SD else None
+
+plt.figure(figsize=(10, 6))
+x_pos = np.arange(len(g))
+bar_w = 0.38
+plt.bar(x_pos - bar_w/2, g["True_Cys"], width=bar_w, label="True HPLC",
+        yerr=yerr_true, capsize=3 if SHOW_HPLC_SD else 0)
+plt.bar(x_pos + bar_w/2, g["Mean_Pred"], width=bar_w,
+        label=f"Mean Predicted",
+        yerr=yerr_pred, capsize=3)
+plt.xticks(x_pos, g["Cultivar"], rotation=45, ha="right")
+plt.ylabel("Cys Concentration (g/100g)")
+plt.title("Mean Predicted vs True HPLC values per Cultivar")
+plt.grid(axis='y', alpha=0.2)
+plt.legend()
+plt.tight_layout()
+plt.savefig("bar_mean_true_vs_pred.png")
+plt.close()
+
+# Save per-cultivar table with absolute errors
+g_out = g.copy()
+g_out["Abs_Error"]    = (g_out["Mean_Pred"] - g_out["True_Cys"]).abs()
+g_out["Pct_Error_%"]  = 100.0 * g_out["Abs_Error"] / g_out["True_Cys"]
+g_out["SE_Pred"]      = g_out["Std_Pred"] / np.sqrt(g_out["N"])
+cols = ["Cultivar", "True_Cys", "Mean_Pred", "Abs_Error", "Pct_Error_%", "N", "Std_Pred", "SE_Pred"]
+g_out[cols].to_csv("mean_vs_true_by_cultivar.csv", index=False)
+
+print("\nSaved bar plot -> bar_mean_true_vs_pred.png")
+print("Saved per-cultivar summary -> mean_vs_true_by_cultivar.csv")
+
+# === Predicted vs True scatter for the test set ===
+plt.figure(figsize=(6, 6))
+plt.scatter(targets, preds, alpha=0.7)
+mn, mx = min(targets.min(), preds.min()), max(targets.max(), preds.max())
+plt.plot([mn, mx], [mn, mx], 'k--', label='Ideal')
+plt.xlabel("True Cys (g/100g)")
+plt.ylabel("Predicted Cys (g/100g)")
+plt.title("Predicted vs True Cys (Testing Set)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("calibration_plot_testing_set.png")
+plt.close()
+
+# === Loss curves ===
+plt.figure()
+plt.plot(train_losses, label="Train")
+plt.plot(test_losses, label="Test")
+plt.title("Loss Curve")
+plt.xlabel("Epoch")
+plt.ylabel("SmoothL1 Loss")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.savefig("Model_Loss.png")
+plt.close()
