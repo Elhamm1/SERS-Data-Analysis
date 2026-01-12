@@ -1,0 +1,182 @@
+import os
+import glob
+import re
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+
+# === Paths ===
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TRIMMED_DIR = os.path.join(SCRIPT_DIR, "Trimmed")
+FILTERED_DIR = os.path.join(SCRIPT_DIR, "Filtered")
+AUG_TRAIN_DIR = os.path.join(SCRIPT_DIR, "TrainingSet_tensors")  # kept for compatibility (not used for saving)
+PLOT_FILE = os.path.join(SCRIPT_DIR, "SERS_Spectra_Overlay.png")
+
+# New: fixed output base + split dirs
+BASE_PRETEST_PATH = "/home/elhamm/links/projects/def-qianl/elhamm/AI-CysConcentrations-SERS/Real-SERS-Data"
+TEST_DIR = os.path.join(BASE_PRETEST_PATH, "TestingData")
+TRAIN_DIR = os.path.join(BASE_PRETEST_PATH, "TrainingData")
+
+# === Config ===
+HEADER_KEY = "Pixel;Wavelength;Wavenumber"
+FILTER_START_ROW = 551
+REQUIRED_COLUMNS = ['Raman Shift', 'Dark Subtracted #1']
+
+# === Create output folders ===
+for folder in [TRIMMED_DIR, FILTERED_DIR, AUG_TRAIN_DIR, TEST_DIR, TRAIN_DIR]:
+    os.makedirs(folder, exist_ok=True)
+
+# === Trim files ===
+def trim_file_at_header(filepath):
+    with open(filepath, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+    header_index = next((i for i, line in enumerate(lines) if HEADER_KEY in line), -1)
+    if header_index == -1:
+        print(f"⚠️ Header not found in {filepath}")
+        return None
+    trimmed_path = os.path.join(TRIMMED_DIR, os.path.basename(filepath))
+    with open(trimmed_path, 'w', encoding='utf-8') as f:
+        f.writelines(lines[header_index + 1:])
+    print(f"🧹 Trimmed: {filepath} → {trimmed_path}")
+    return trimmed_path
+
+# === Filter files (no split anymore) ===
+def filter_columns_and_save(filepath):
+    try:
+        df = pd.read_csv(filepath, sep=';', engine='python')
+        if df.shape[0] <= FILTER_START_ROW or df.shape[1] <= 7:
+            raise ValueError("Insufficient data")
+        df_subset = df.iloc[FILTER_START_ROW:, [3, 7]]
+        df_subset.columns = REQUIRED_COLUMNS
+        base = os.path.splitext(os.path.basename(filepath))[0]
+        filtered_csv = os.path.join(FILTERED_DIR, base + ".csv")
+        df_subset.to_csv(filtered_csv, index=False)
+        print(f"✅ Filtered: {filepath} → {filtered_csv}")
+        return filtered_csv
+    except Exception as e:
+        print(f"❌ Failed to process {filepath}: {e}")
+        return None
+
+# === Plot spectra ===
+def plot_filtered_spectra(files):
+    plt.figure(figsize=(12, 6))
+    for file_path in files:
+        try:
+            df = pd.read_csv(file_path)
+            plt.plot(df['Raman Shift'], df['Dark Subtracted #1'],
+                     label=os.path.splitext(os.path.basename(file_path))[0], linewidth=1)
+        except Exception as e:
+            print(f"❌ Could not plot {file_path}: {e}")
+    plt.xlabel("Raman Shift (cm⁻¹)")
+    plt.ylabel("Intensity (a.u.)")
+    plt.title("SERS Spectra")
+#    plt.legend(fontsize='small', loc='upper right')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(PLOT_FILE)
+    plt.close()
+    print(f"📊 Plot saved: {PLOT_FILE}")
+
+# === Helper: classify run tag (R1_#, R2_#, R3_#) ===
+_run_re = re.compile(r'(R[1-3])_(\d+)$')
+
+def classify_destination_from_name(stem: str):
+    """
+    Given a filename stem (without extension), find trailing R[1-3]_<num>
+    and return the destination directory (TEST_DIR or TRAIN_DIR).
+    Returns None if no valid pattern is found or number is out of range.
+    """
+    m = _run_re.search(stem)
+    if not m:
+        return None  # pattern not found
+    run = m.group(1)  # e.g., R1, R2, R3 (not used beyond validation)
+    idx = int(m.group(2))
+    if 1 <= idx <= 7:
+        return TEST_DIR
+    elif 8 <= idx <= 36:
+        return TRAIN_DIR
+    else:
+        return None  # out of expected range
+
+# === Convert all CSVs to .npy in two output folders ===
+def convert_all_csv_to_npy():
+    print("🔧 Converting all CSVs to .npy files (split into TrainingData & TestingData)...")
+
+    files = glob.glob(os.path.join(FILTERED_DIR, "*.csv"))
+    saved_test, saved_train, skipped = 0, 0, 0
+
+    for file_path in files:
+        try:
+            df = pd.read_csv(file_path)
+            signal = df['Dark Subtracted #1'].values
+
+            stem = os.path.splitext(os.path.basename(file_path))[0]
+            dest_dir = classify_destination_from_name(stem)
+
+            if dest_dir is None:
+                print(f"⚠️ Skipping (no valid R[1-3]_# at end or out of range 1–36): {file_path}")
+                skipped += 1
+                continue
+
+            npy_filename = "AAC_Chrome_" + stem + ".npy"
+            np.save(os.path.join(dest_dir, npy_filename), np.expand_dims(signal, axis=0))
+
+            if dest_dir == TEST_DIR:
+                saved_test += 1
+            else:
+                saved_train += 1
+
+        except Exception as e:
+            print(f"❌ {file_path}: {e}")
+
+    print(f"✅ Saved {saved_test} .npy files to TestingData → {TEST_DIR}")
+    print(f"✅ Saved {saved_train} .npy files to TrainingData → {TRAIN_DIR}")
+    if skipped:
+        print(f"ℹ️ Skipped {skipped} files due to unmatched/invalid run tag.")
+
+# === Print shape from one sample file per folder ===
+def print_sample_file_shape(folder, ext, parser='pandas'):
+    files = sorted(glob.glob(os.path.join(folder, f"*{ext}")))
+    print(f"\n📂 Folder: {os.path.basename(folder)} ({len(files)} files)")
+    if not files:
+        print("📄 No files found.")
+        return
+    try:
+        if parser == 'pandas':
+            df = pd.read_csv(files[0])
+            print(f"📄 File shape: {df.shape[0]} rows × {df.shape[1]} columns")
+        elif parser == 'numpy':
+            arr = np.load(files[0])
+            print(f"📄 File shape: {arr.shape}")
+    except Exception as e:
+        print(f"❌ Could not read {files[0]}: {e}")
+
+# === Main ===
+def main():
+    print("🚀 Starting pipeline...\n")
+    np.random.seed(42)
+
+    trimmed = [trim_file_at_header(f) for f in glob.glob("*.txt")]
+    trimmed = [f for f in trimmed if f]
+
+    filtered = [filter_columns_and_save(f) for f in trimmed]
+    filtered = [f for f in filtered if f]
+
+    plot_filtered_spectra(filtered)
+    convert_all_csv_to_npy()
+
+    # === Summary of file shapes ===
+    print("\n📊 Summary of File Shapes:")
+    print_sample_file_shape(TRIMMED_DIR, ".txt", parser='pandas')
+    print_sample_file_shape(FILTERED_DIR, ".csv", parser='pandas')
+    # Keep legacy dir for visibility (may be empty)
+    print_sample_file_shape(AUG_TRAIN_DIR, ".npy", parser='numpy')
+    # New: show split outputs
+    print_sample_file_shape(TEST_DIR, ".npy", parser='numpy')
+    print_sample_file_shape(TRAIN_DIR, ".npy", parser='numpy')
+
+    print("\n🏁 All tasks complete.")
+
+if __name__ == "__main__":
+    main()
+
