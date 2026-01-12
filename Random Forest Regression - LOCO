@@ -1,0 +1,618 @@
+# Full LOCO cross-validation using RandomForestRegressor 
+
+import os
+import glob
+import time
+import json
+import random
+import numpy as np
+import pandas as pd
+
+# plotting (headless-safe)
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# modeling
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+    max_error,
+    mean_absolute_percentage_error,
+    explained_variance_score,
+)
+from sklearn.linear_model import LinearRegression
+from sklearn.manifold import TSNE
+from sklearn.preprocessing import StandardScaler
+from joblib import dump
+
+# =====================
+# Parameters & Config
+# =====================
+input_length = 1496            # expected spectrum length (L)
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+
+# Random Forest hyperparameters
+RF_TREES     = 300
+RF_MAX_DEPTH = 20        # set None for deeper trees (slower)
+RF_JOBS      = -1
+RF_MAX_FEATURES = "sqrt"
+
+# Directory containing ALL spectra (*.npy) for LOCO-CV
+# Filenames must start with cultivar names from cultivar_cys_map
+
+data_dir = "../../CrossValidationData"
+
+# =====================
+# Cultivar ground truth
+# =====================
+cultivar_cys_map = {
+    "AAC_Chrome":    0.3208,
+    "AAC_Lacombe":   0.3428,
+    "AAC_Liscard":   0.3181,
+    "CDC_Amarillo":  0.3834,
+    "CDC_Athabasca": 0.3418,
+    "CDC_Canary":    0.3117,
+    "CDC_Dakota":    0.3293,
+    "CDC_Golden":    0.3536,
+    "CDC_Greenwater":0.3446,
+    "CDC_Inca":      0.3730,
+    "CDC_Jasper":    0.3360,
+    "CDC_Striker":   0.3575,
+    "CDC_Lewochko":  0.3469,
+    "CDC_Meadow":    0.3180,
+    "CDC_Patrick":   0.3626,
+    "CDC_Saffron":   0.3552,
+    "CDC_Spectrum":  0.3948,
+    "CDC_Spruce":    0.3535,
+    "CDC_Tetris":    0.3531,
+    "Redbat88":      0.3194,
+}
+
+# Optional measurement SDs for plotting horizontal error bars
+cultivar_sd_map = {
+    "AAC_Chrome":    0.0146,
+    "AAC_Lacombe":   0.0401,
+    "AAC_Liscard":   0.0601,
+    "CDC_Amarillo":  0.0458,
+    "CDC_Athabasca": 0.0215,
+    "CDC_Canary":    0.0090,
+    "CDC_Dakota":    0.0434,
+    "CDC_Golden":    0.0425,
+    "CDC_Greenwater":0.0086,
+    "CDC_Inca":      0.0266,
+    "CDC_Jasper":    0.0099,
+    "CDC_Striker":   0.0182,
+    "CDC_Lewochko":  0.0539,
+    "CDC_Meadow":    0.0099,
+    "CDC_Patrick":   0.0459,
+    "CDC_Saffron":   0.0319,
+    "CDC_Spectrum":  0.0275,
+    "CDC_Spruce":    0.0028,
+    "CDC_Tetris":    0.0034,
+    "Redbat88":      0.0324,
+}
+
+# =====================
+# Helpers
+# =====================
+def find_cultivar_from_filename(filename: str, cultivar_keys):
+    """Return the cultivar key if filename STARTS WITH that key; else None."""
+    for key in cultivar_keys:
+        if filename.startswith(key):
+            return key
+    return None
+
+def load_spectra_array(file_path: str, expected_len: int) -> np.ndarray:
+    """Load a .npy into shape (N, L). Accepts (L,), (N, L), (N,1,L)."""
+    arr = np.load(file_path)
+    arr = np.asarray(arr)
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    elif arr.ndim == 3 and arr.shape[1] == 1:
+        arr = arr[:, 0, :]
+    elif arr.ndim != 2:
+        raise ValueError(f"Unexpected array shape {arr.shape} for {os.path.basename(file_path)}")
+    if arr.shape[1] != expected_len:
+        raise ValueError(
+            f"{os.path.basename(file_path)} has length {arr.shape[1]} != expected {expected_len}"
+        )
+    return arr
+
+# =====================
+# LOCO Cross-Validation (overall-only plots)
+# =====================
+all_files = sorted(glob.glob(os.path.join(data_dir, "*.npy")))
+if len(all_files) == 0:
+    print(f"⚠️ No .npy files found in {data_dir}")
+
+cultivars = list(cultivar_cys_map.keys())
+
+all_preds, all_targets, all_cultivars = [], [], []
+results = []             # per-fold metrics
+
+# For overall curves (single-point per fold to match file contract)
+fold_train_mae_histories = []
+fold_train_me_histories  = []
+fold_val_mae_histories   = []
+fold_val_me_histories    = []
+
+# For overall t-SNE (use RF leaf-index embedding)
+global_features = []   # list of numpy arrays (N_val_fold, n_trees)
+global_y_true   = []   # list of numpy arrays (N_val_fold,)
+global_cultivars= []   # list of numpy arrays (N_val_fold,)
+
+# Track best overall model across folds (by lowest val MAE)
+best_overall = {"cultivar": None, "epoch": 1, "val_mae": float("inf"), "ckpt": None}
+
+# --- Timing: training only (models/selection) ---
+cv_train_start = time.time()
+
+for fold_idx, test_cultivar in enumerate(cultivars, 1):
+    print("\n" + "="*72)
+    print(f"Fold {fold_idx}/{len(cultivars)} — Test cultivar: {test_cultivar}")
+    print("="*72)
+
+    fold_start = time.time()
+
+    train_X, train_y, test_X, test_y = [], [], [], []
+
+    # Split by cultivar prefix only
+    for fp in all_files:
+        fname = os.path.basename(fp)
+        cv = find_cultivar_from_filename(fname, cultivars)
+        if cv is None:
+            print(f"⚠️ Skipping unknown file (no cultivar prefix match): {fname}")
+            continue
+
+        arr = load_spectra_array(fp, input_length)
+        y_vec = np.full((arr.shape[0],), cultivar_cys_map[cv], dtype=float)
+
+        if cv == test_cultivar:
+            test_X.append(arr); test_y.append(y_vec)
+        else:
+            train_X.append(arr); train_y.append(y_vec)
+
+    if len(test_X) == 0 or len(train_X) == 0:
+        print(f"Skipping fold {test_cultivar}: insufficient data.")
+        continue
+
+    X_train = np.vstack(train_X)
+    y_train = np.hstack(train_y)
+    X_test  = np.vstack(test_X)
+    y_test  = np.hstack(test_y)
+
+    # --- Train Random Forest for this fold ---
+    rf = RandomForestRegressor(
+        n_estimators=RF_TREES,
+        max_depth=RF_MAX_DEPTH,
+        random_state=SEED,
+        n_jobs=RF_JOBS,
+        max_features=RF_MAX_FEATURES,
+    )
+    rf.fit(X_train, y_train)
+
+    # Save per-fold best model checkpoint (joblib)
+    dump(rf, f"best_{test_cultivar}.joblib")
+
+    # --- Metrics for this fold (acts like epoch=1) ---
+    ytr_pred = rf.predict(X_train)
+    yva_pred = rf.predict(X_test)
+
+    train_mae_epoch = float(mean_absolute_error(y_train, ytr_pred))
+    train_me_epoch  = float(max_error(y_train, ytr_pred))
+    val_mae_epoch   = float(mean_absolute_error(y_test, yva_pred))
+    val_me_epoch    = float(max_error(y_test, yva_pred))
+
+    # Append single-point “histories” (so overall curves have one point)
+    fold_train_mae_histories.append([train_mae_epoch])
+    fold_train_me_histories.append([train_me_epoch])
+    fold_val_mae_histories.append([val_mae_epoch])
+    fold_val_me_histories.append([val_me_epoch])
+
+    # Gather features for OVERALL t-SNE: use RF leaf-index embedding
+    try:
+        # apply() returns leaf indices per tree: shape (N_val, n_trees)
+        leaf_idx = rf.apply(X_test).astype(float)
+        global_features.append(leaf_idx)
+        global_y_true.append(y_test.copy())
+        global_cultivars.append(np.array([test_cultivar]*len(y_test)))
+    except Exception as e:
+        print(f"(t-SNE features skipped this fold — {e})")
+
+    # Per-fold metrics (keep)
+    mae  = float(val_mae_epoch)
+    rmse = float(np.sqrt(mean_squared_error(y_test, yva_pred)))
+    r2   = float(r2_score(y_test, yva_pred))
+
+    results.append({
+        "cultivar": test_cultivar,
+        "BestEpoch": 1,                 # RF has no epochs; keep for compatibility
+        "BestValMAE": float(val_mae_epoch),
+        "MAE": float(mae),
+        "RMSE": float(rmse),
+        "R2": float(r2)
+    })
+
+    # Track best overall across folds
+    if val_mae_epoch < best_overall["val_mae"]:
+        best_overall.update({
+            "cultivar": test_cultivar,
+            "epoch": 1,
+            "val_mae": float(val_mae_epoch),
+            "ckpt": f"best_{test_cultivar}.joblib",
+        })
+
+    # Accumulate for global summaries
+    all_preds.extend(yva_pred.tolist())
+    all_targets.extend(y_test.tolist())
+    all_cultivars.extend([test_cultivar]*len(y_test))
+
+    print(f"[{test_cultivar}] Train MAE {train_mae_epoch:.6f} | Val MAE {val_mae_epoch:.6f}")
+    print(f"✅ Fold '{test_cultivar}' best epoch: 1 with Val MAE={val_mae_epoch:.6f}")
+    print(f"⏱️ Fold time (train/val only) so far: {time.time() - fold_start:.2f} s")
+
+# ===== Close the training-only timer BEFORE any plots / files =====
+cv_train_time = time.time() - cv_train_start
+print(f"\n⏱️ Cross-validation training time (models only, no plotting/exports): {cv_train_time:.2f} seconds")
+
+# Start timing for plotting/exports
+post_start = time.time()
+
+# =====================
+# Post-CV: overall selections & plots
+# =====================
+if len(all_preds) == 0:
+    raise SystemExit("No predictions collected. Check your data_dir and filenames.")
+
+all_preds      = np.array(all_preds)
+all_targets    = np.array(all_targets)
+all_cultivars  = np.array(all_cultivars)
+
+# Save per-fold metrics
+pd.DataFrame(results).to_csv("per_fold_metrics.csv", index=False)
+
+# Select and save the single best-overall model checkpoint
+if best_overall["ckpt"] is not None and os.path.exists(best_overall["ckpt"]):
+    import shutil
+    shutil.copyfile(best_overall["ckpt"], "best_overall.joblib")
+    with open("best_overall_model.json", "w") as f:
+        json.dump(best_overall, f, indent=2)
+    print(f"\n🏆 Best overall model: fold '{best_overall['cultivar']}', epoch {best_overall['epoch']}\n"
+          f"    Val MAE = {best_overall['val_mae']:.6f} (saved as best_overall.joblib)")
+else:
+    print("\n⚠️ Could not save best_overall.joblib — no best checkpoint found.")
+
+# -----------------
+# OVERALL loss curves (Train + Val metrics aggregated across folds)
+# -----------------
+def _aggregate_histories(hist_list):
+    """Pad histories to equal length with NaNs, then compute mean±SD ignoring NaNs."""
+    max_len = max(len(h) for h in hist_list)
+    arr = np.full((len(hist_list), max_len), np.nan, dtype=float)
+    for i, h in enumerate(hist_list):
+        arr[i, :len(h)] = h
+    mean = np.nanmean(arr, axis=0)
+    std  = np.nanstd(arr, axis=0, ddof=1) if arr.shape[0] > 1 else np.zeros_like(mean)
+    return mean, std
+
+# MAE curves (Train + Val)
+tr_mae_mean, tr_mae_std = _aggregate_histories(fold_train_mae_histories)
+va_mae_mean, va_mae_std = _aggregate_histories(fold_val_mae_histories)
+
+plt.figure()
+x_mae = np.arange(len(va_mae_mean))
+plt.plot(x_mae, tr_mae_mean, label="Train MAE (mean across folds)")
+if np.any(tr_mae_std > 0): plt.fill_between(x_mae, tr_mae_mean - tr_mae_std, tr_mae_mean + tr_mae_std, alpha=0.15, label="Train ±1 SD")
+plt.plot(x_mae, va_mae_mean, label="Val MAE (mean across folds)")
+if np.any(va_mae_std > 0): plt.fill_between(x_mae, va_mae_mean - va_mae_std, va_mae_mean + va_mae_std, alpha=0.20, label="Val ±1 SD")
+plt.xlabel("Epoch"); plt.ylabel("MAE")
+plt.title("Overall MAE vs Epoch (LOCO)")
+plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
+plt.savefig("overall_loss_curve_MAE_train_val.png"); plt.close()
+
+# Max Error curves (Train + Val)
+tr_me_mean, tr_me_std = _aggregate_histories(fold_train_me_histories)
+va_me_mean, va_me_std = _aggregate_histories(fold_val_me_histories)
+
+plt.figure()
+x_me = np.arange(len(va_me_mean))
+plt.plot(x_me, tr_me_mean, label="Train Max Error (mean across folds)")
+if np.any(tr_me_std > 0): plt.fill_between(x_me, tr_me_mean - tr_me_std, tr_me_mean + tr_me_std, alpha=0.15, label="Train ±1 SD")
+plt.plot(x_me, va_me_mean, label="Val Max Error (mean across folds)")
+if np.any(va_me_std > 0): plt.fill_between(x_me, va_me_mean - va_me_std, va_me_mean + va_me_std, alpha=0.20, label="Val ±1 SD")
+plt.xlabel("Epoch"); plt.ylabel("Max Error")
+plt.title("Overall Max Error vs Epoch (LOCO)")
+plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
+plt.savefig("overall_loss_curve_ME_train_val.png"); plt.close()
+
+# -----------------
+# OVERALL mean prediction with CI (vs overall true mean)
+# -----------------
+try:
+    from scipy import stats
+    mean_pred = float(np.mean(all_preds))
+    std_pred  = float(np.std(all_preds, ddof=1))
+    n = len(all_preds)
+    confidence_level = 0.90
+    alpha = 1 - confidence_level
+    t_critical = float(stats.t.ppf(1 - alpha/2, df=n-1))
+    margin = t_critical * std_pred / np.sqrt(n)
+    ci_lower, ci_upper = mean_pred - margin, mean_pred + margin
+
+    true_mean = float(np.mean(all_targets))
+
+    # Error bar plot with CI
+    plt.figure()
+    plt.errorbar(x=[true_mean], y=[mean_pred],
+                 yerr=[[max(0.0, mean_pred - ci_lower)], [max(0.0, ci_upper - mean_pred)]],
+                 fmt='o', capsize=5, label=f'Mean ± {int(confidence_level*100)}% CI')
+    try:
+        plt.axline((true_mean, true_mean), slope=1, linestyle='--', label='Ideal')
+    except Exception:
+        plt.plot([true_mean-1, true_mean+1], [true_mean-1, true_mean+1], 'k--', label='Ideal')
+    plt.xlabel("True Mean Cys (g/100 g)")
+    plt.ylabel("Predicted Mean Cys (g/100 g)")
+    plt.title(f"Overall Mean Prediction with {int(confidence_level*100)}% CI (n={n})")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("mean_prediction_with_CI_OVERALL.png")
+    plt.close()
+
+    # Histogram of ALL predictions
+    plt.figure()
+    plt.hist(all_preds, bins=30, edgecolor='black')
+    plt.axvline(mean_pred, linestyle='--', label=f'Mean: {mean_pred:.3f}')
+    plt.axvline(ci_lower, linestyle=':', label=f'{int(confidence_level*100)}% CI')
+    plt.axvline(ci_upper, linestyle=':')
+    plt.title("Distribution of Predictions — Overall")
+    plt.xlabel("Predicted Cys (g/100 g)")
+    plt.ylabel("Frequency")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("prediction_distribution_OVERALL.png")
+    plt.close()
+except Exception as e:
+    print(f"(Overall CI skipped — {e})")
+
+# -----------------
+# OVERALL t-SNE using ALL held-out features (RF leaf-index embedding)
+# -----------------
+if len(global_features) > 0:
+    Feat = np.concatenate(global_features, axis=0)  # (N_total, n_trees) of leaf indices
+    y_tsne = np.concatenate(global_y_true, axis=0)
+    cv_tsne= np.concatenate(global_cultivars, axis=0)
+
+    # Standardize features before t-SNE
+    Feat = StandardScaler().fit_transform(Feat)
+
+    N = Feat.shape[0]
+    if N >= 10:
+        perp = float(max(5, min(30, max(5, (N - 1) // 3))))
+        try:
+            tsne = TSNE(
+                n_components=2,
+                perplexity=perp,
+                init="pca",
+                learning_rate="auto",
+                n_iter=1000,
+                random_state=SEED,
+                verbose=0,
+            )
+            Z = tsne.fit_transform(Feat)
+
+            # Plot t-SNE colored by cultivar (categorical)
+            plt.figure(figsize=(8, 6))
+            uniq = np.unique(cv_tsne)
+            for cv_lab in uniq:
+                idx = (cv_tsne == cv_lab)
+                plt.scatter(Z[idx, 0], Z[idx, 1], s=20, alpha=0.85, label=cv_lab)
+            plt.title(f"t-SNE of RF Leaf Embedding — OVERALL (perp={perp:.0f})")
+            plt.xlabel("t-SNE 1"); plt.ylabel("t-SNE 2")
+            plt.legend(loc="best", frameon=True, fontsize=9)
+            plt.tight_layout()
+            plt.savefig("tsne_OVERALL_by_cultivar.png")
+            plt.close()
+
+            # Plot t-SNE colored by true Cys (continuous)
+            plt.figure(figsize=(8, 6))
+            sc = plt.scatter(Z[:, 0], Z[:, 1], c=y_tsne, s=20, alpha=0.9, cmap="viridis")
+            plt.title(f"t-SNE of RF Leaf Embedding by True Cys — OVERALL (perp={perp:.0f})")
+            plt.xlabel("t-SNE 1"); plt.ylabel("t-SNE 2")
+            cbar = plt.colorbar(sc); cbar.set_label("True Cys (g/100 g)")
+            plt.tight_layout()
+            plt.savefig("tsne_OVERALL_by_cys.png")
+            plt.close()
+
+            # Save coordinates for later analysis
+            tsne_df = pd.DataFrame({
+                "tsne_1": Z[:, 0],
+                "tsne_2": Z[:, 1],
+                "true_cys": y_tsne,
+                "cultivar": cv_tsne
+            })
+            tsne_df.to_csv("tsne_coords_OVERALL.csv", index=False)
+
+            print("Saved OVERALL t-SNE: tsne_OVERALL_by_cultivar.png, tsne_OVERALL_by_cys.png")
+        except Exception as e:
+            print(f"(Overall t-SNE skipped — {e})")
+    else:
+        print(f"Not enough samples for OVERALL t-SNE (N={N}); skipping.")
+else:
+    print("No features collected for OVERALL t-SNE; skipping.")
+
+# =====================
+# Global summaries across folds 
+# =====================
+# Overall metrics
+mae_all  = mean_absolute_error(all_targets, all_preds)
+rmse_all = np.sqrt(mean_squared_error(all_targets, all_preds))
+r2_all   = r2_score(all_targets, all_preds)
+print("\n================ OVERALL (across all folds) ================")
+print(f"MAE                 : {mae_all:.6f}")
+print(f"RMSE                : {rmse_all:.6f}")
+print(f"R²                  : {r2_all:.6f}")
+print(f"Max Error           : {max_error(all_targets, all_preds):.6f}")
+print(f"MAPE                : {mean_absolute_percentage_error(all_targets, all_preds):.6f}")
+print(f"Explained Variance  : {explained_variance_score(all_targets, all_preds):.6f}")
+
+# Save per-spectrum table (ALL folds)
+df = pd.DataFrame({
+    "True Cys": all_targets,
+    "Predicted Cys": all_preds,
+    "Cultivar": all_cultivars,
+})
+df.to_csv("test_predictions_all_folds.csv", index=False)
+
+# --- Per-spectrum scatter with separate error bars ---
+plt.figure(figsize=(8, 6))
+seen = set()
+for cv in sorted(set(all_cultivars.tolist())):
+    sub = df[df["Cultivar"] == cv]
+    y_true = sub["True Cys"].to_numpy()
+    y_pred = sub["Predicted Cys"].to_numpy()
+    model_err = np.abs(y_pred - y_true)
+    label = cv if cv not in seen else "_nolegend_"
+    seen.add(cv)
+    plt.errorbar(y_true, y_pred, yerr=model_err, fmt='o', alpha=0.8, capsize=3, elinewidth=1.2, label=label)
+    plt.errorbar(y_true, y_pred, fmt='none', ecolor='gray', linestyle='dotted', capsize=2, elinewidth=1.0)
+
+mn = float(min(df["True Cys"].min(), df["Predicted Cys"].min()))
+mx = float(max(df["True Cys"].max(), df["Predicted Cys"].max()))
+plt.plot([mn, mx], [mn, mx], 'k--', label="_nolegend_")
+plt.title("Predicted vs. True with Separate Error Bars")
+plt.xlabel("True Cys (g/100 g)")
+plt.ylabel("Predicted Cys (g/100 g)")
+plt.grid(True, alpha=0.2)
+plt.legend(loc='upper left', frameon=True, ncol=1)
+plt.tight_layout()
+plt.savefig("Predicted_vs_True_Separate_Errors.png")
+plt.close()
+
+# --- Mean per cultivar summary plot (keep; y-error only) ---
+g = (df.groupby("Cultivar")
+       .agg(True_Cys=("True Cys", "first"),
+            Mean_Pred=("Predicted Cys", "mean"),
+            Std_Pred=("Predicted Cys", "std"),
+            N=("Predicted Cys", "size"))
+       .reset_index())
+
+plt.figure(figsize=(10, 6))
+use_standard_error = False  # SD vs SE
+for _, row in g.iterrows():
+    cultivar = row["Cultivar"]
+    x = float(row["True_Cys"])
+    y = float(row["Mean_Pred"])
+    yerr = float(row["Std_Pred"] / np.sqrt(row["N"]) if use_standard_error else row["Std_Pred"])
+    plt.errorbar(x, y, yerr=yerr, fmt='o', capsize=3, elinewidth=1.2, label=cultivar, alpha=0.9)
+    plt.errorbar(x, y, fmt='none', ecolor='gray', linestyle='dotted', capsize=2, elinewidth=1.0)
+
+mn = float(min(g["True_Cys"].min(), g["Mean_Pred"].min()))
+mx = float(max(g["True_Cys"].max(), g["Mean_Pred"].max()))
+ax = plt.gca()
+ax.set_aspect('equal', adjustable='box')
+pad = 0.002
+ax.set_xlim(mn - pad, mx + pad)
+ax.set_ylim(mn - pad, mx + pad)
+ax.plot([mn - pad, mx + pad], [mn - pad, mx + pad], 'k--', label='Ideal (y=x)')
+
+X = g["True_Cys"].to_numpy().reshape(-1, 1)
+y_means = g["Mean_Pred"].to_numpy()
+reg = LinearRegression().fit(X, y_means)
+slope = float(reg.coef_[0])
+intercept = float(reg.intercept_)
+x_line = np.linspace(mn - pad, mx + pad, 200)
+ax.plot(x_line, slope * x_line + intercept, '-', linewidth=2, color='C1', label=f'Fit: y={slope:.3f}x+{intercept:.3f}')
+
+r2_means = r2_score(g["True_Cys"], g["Mean_Pred"])
+r2_fit   = r2_score(y_means, reg.predict(X))
+
+y_std   = all_targets.std(ddof=1)
+y_range = all_targets.max() - all_targets.min()
+rmse    = np.sqrt(mean_squared_error(all_targets, all_preds))
+
+ax.text(0.02, 0.98, f"""R^2 vs identity = {r2_means:.3f}
+R^2 of fit = {r2_fit:.3f}""", transform=ax.transAxes, ha="left", va="top", bbox=dict(boxstyle="round", facecolor="white", alpha=0.7))
+ax.text(0.02, 0.82, f"""RMSE/std(y) = {rmse / y_std:.3f}
+RMSE/range(y) = {rmse / y_range:.3f}""", transform=ax.transAxes, ha="left", va="top", bbox=dict(boxstyle="round", facecolor="white", alpha=0.7))
+
+plt.title("Mean Predicted vs. True HPLC per Cultivar")
+plt.xlabel("True HPLC Cys (g/100 g)")
+plt.ylabel("Mean Predicted Cys (g/100 g)")
+ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0, frameon=True)
+plt.tight_layout(rect=(0.0, 0.0, 0.80, 1.0))
+plt.savefig("Predicted_vs_True_Separate_Errors_MEAN.png")
+plt.close()
+
+# --- Calibration plot (keep) ---
+plt.figure(figsize=(6,6))
+plt.scatter(all_targets, all_preds, alpha=0.7)
+mn_sc, mx_sc = min(all_targets.min(), all_preds.min()), max(all_targets.max(), all_preds.max())
+plt.plot([mn_sc, mx_sc], [mn_sc, mx_sc], 'k--', label='Ideal')
+plt.xlabel("True Cys (g/100 g)")
+plt.ylabel("Predicted Cys (g/100 g)")
+plt.title("Predicted vs True Cys (All Folds)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("calibration_plot.png")
+plt.close()
+
+# --- Bar plot per cultivar (keep) + CSV
+SHOW_HPLC_SD = False
+plt.figure(figsize=(10, 6))
+x = np.arange(len(g))
+bar_w = 0.38
+use_standard_error = False
+
+yerr_pred = (g["Std_Pred"] / np.sqrt(g["N"])) if use_standard_error else g["Std_Pred"]
+yerr_pred = np.nan_to_num(yerr_pred.to_numpy(), nan=0.0)
+
+yerr_true = np.array([cultivar_sd_map.get(cv, 0.0) for cv in g["Cultivar"]]) if SHOW_HPLC_SD else None
+
+plt.bar(x - bar_w/2, g["True_Cys"], width=bar_w, label="True (HPLC)", yerr=yerr_true, capsize=3 if SHOW_HPLC_SD else 0)
+plt.bar(x + bar_w/2, g["Mean_Pred"], width=bar_w, label=f"Predicted (mean){' ± SE' if use_standard_error else ' ± SD'}", yerr=yerr_pred, capsize=3)
+
+plt.xticks(x, g["Cultivar"], rotation=45, ha="right")
+plt.ylabel("Cys (g/100 g)")
+plt.title("Mean Predicted vs True (HPLC) per Cultivar — CV")
+plt.grid(axis='y', alpha=0.2)
+plt.legend()
+plt.tight_layout()
+plt.savefig("bar_mean_true_vs_pred.png")
+plt.close()
+
+# --- Save cultivar-level summary CSV (keep)
+g_out = g.copy()
+g_out["Abs_Error"]   = (g_out["Mean_Pred"] - g_out["True_Cys"]).abs()
+g_out["Pct_Error_%"] = 100.0 * g_out["Abs_Error"] / g_out["True_Cys"]
+g_out["SE_Pred"]     = g_out["Std_Pred"] / np.sqrt(g_out["N"]) 
+
+cols = ["Cultivar", "True_Cys", "Mean_Pred", "Abs_Error", "Pct_Error_%", "N", "Std_Pred", "SE_Pred"]
+g_out[cols].to_csv("mean_vs_true_by_cultivar_cv.csv", index=False)
+
+print("\nSaved global artifacts:")
+print("- test_predictions_all_folds.csv")
+print("- overall_loss_curve_MAE_train_val.png")
+print("- overall_loss_curve_ME_train_val.png")
+print("- mean_prediction_with_CI_OVERALL.png")
+print("- prediction_distribution_OVERALL.png")
+print("- tsne_OVERALL_by_cultivar.png")
+print("- tsne_OVERALL_by_cys.png")
+print("- tsne_coords_OVERALL.csv")
+print("- Predicted_vs_True_Separate_Errors.png")
+print("- Predicted_vs_True_Separate_Errors_MEAN.png")
+print("- calibration_plot.png")
+print("- bar_mean_true_vs_pred.png")
+print("- mean_vs_true_by_cultivar_cv.csv")
+print("- per_fold_metrics.csv")
+
+# ---- Timing summary ----
+post_time = time.time() - post_start
+print(f"\n📦 Post-processing time (plots / CSVs / t-SNE): {post_time:.2f} seconds")
+print(f"🕒 End-to-end wall time (training + post): {cv_train_time + post_time:.2f} seconds")
