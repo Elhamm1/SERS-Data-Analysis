@@ -1,7 +1,10 @@
 # SERS-Data-Analysis
 Code repository for the paper:
 
-**“Generalizable Cysteine Quantification in Pea Cultivars from SERS Spectra Using AI”**
+# Generalizable Cysteine Quantification in Pea Cultivars from SERS Spectra Using AI
+
+# Workflow
+Overall workflow for SERS data acquisition and AI-based cysteine prediction (figures/Figure1_workflow.png)
 
 This repository contains:
 - Data preparation scripts to assemble the SERS dataset
@@ -11,9 +14,8 @@ This repository contains:
 - Leave-One-Cultivar-Out (LOCO) generalization experiments
 - SHAP-based interpretability and noise robustness study
 
----
 
-## Repository structure
+# Repository structure
 - `Data Preparation/`  
   Scripts to build the dataset used by all models.
 
@@ -45,9 +47,8 @@ PDF instructions:
 - `PreprocessingInstruction.pdf`
 - `1D-CNN-Instruction.pdf`
 
----
 
-## Setup
+# Setup
 
 Create an environment:
 
